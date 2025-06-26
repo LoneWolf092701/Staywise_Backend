@@ -3,9 +3,7 @@ const router = express.Router();
 const auth = require('../middleware/auth');
 const db = require('../config/db');
 
-/**
- * Middleware to verify admin role
- */
+// Middleware to verify admin role
 const requireAdminRole = (req, res, next) => {
   if (req.user.role !== 'admin') {
     return res.status(403).json({ 
@@ -16,10 +14,8 @@ const requireAdminRole = (req, res, next) => {
   next();
 };
 
-/**
- * GET /api/admin/pending-properties
- * Retrieve all properties awaiting admin approval
- */
+// GET /api/admin/pending-properties
+// Retrieve all properties awaiting admin approval
 router.get('/pending-properties', auth, requireAdminRole, (req, res) => {
   const query = `
     SELECT 
@@ -58,10 +54,8 @@ router.get('/pending-properties', auth, requireAdminRole, (req, res) => {
   });
 });
 
-/**
- * GET /api/admin/approved-properties
- * Retrieve all approved properties currently visible to users
- */
+// GET /api/admin/approved-properties
+// Retrieve all approved properties currently visible to users
 router.get('/approved-properties', auth, requireAdminRole, (req, res) => {
   const query = `
     SELECT 
@@ -98,10 +92,90 @@ router.get('/approved-properties', auth, requireAdminRole, (req, res) => {
   });
 });
 
-/**
- * POST /api/admin/approve-property/:id
- * Approve a pending property listing
- */
+// GET /api/admin/property/:id
+// Get property details for admin review (checks both tables)
+router.get('/property/:id', auth, requireAdminRole, (req, res) => {
+  const propertyId = req.params.id;
+  
+  // First check if it's a pending property in property_details
+  const pendingQuery = `
+    SELECT 
+      pd.*,
+      u.username as owner_username,
+      'pending' as source_table
+    FROM property_details pd
+    LEFT JOIN users u ON pd.user_id = u.id
+    WHERE pd.id = ? AND pd.is_deleted = 0
+  `;
+
+  db.query(pendingQuery, [propertyId], (err, pendingResults) => {
+    if (err) {
+      console.error('Error fetching property from property_details:', err);
+      return res.status(500).json({ 
+        error: 'Error fetching property details',
+        details: err.message 
+      });
+    }
+
+    if (pendingResults.length > 0) {
+      // Found in property_details, return it
+      const property = pendingResults[0];
+      const processedProperty = {
+        ...property,
+        amenities: safeJsonParse(property.amenities),
+        facilities: safeJsonParse(property.facilities),
+        roommates: safeJsonParse(property.roommates),
+        rules: safeJsonParse(property.rules),
+        price_range: safeJsonParse(property.price_range),
+        bills_inclusive: safeJsonParse(property.bills_inclusive)
+      };
+      return res.json(processedProperty);
+    }
+
+    // If not found in property_details, check all_properties
+    const approvedQuery = `
+      SELECT 
+        ap.*,
+        u.username as owner_username,
+        'approved' as source_table
+      FROM all_properties ap
+      LEFT JOIN users u ON ap.user_id = u.id
+      WHERE ap.id = ?
+    `;
+
+    db.query(approvedQuery, [propertyId], (err, approvedResults) => {
+      if (err) {
+        console.error('Error fetching property from all_properties:', err);
+        return res.status(500).json({ 
+          error: 'Error fetching property details',
+          details: err.message 
+        });
+      }
+
+      if (approvedResults.length > 0) {
+        const property = approvedResults[0];
+        const processedProperty = {
+          ...property,
+          amenities: safeJsonParse(property.amenities),
+          facilities: safeJsonParse(property.facilities),
+          roommates: safeJsonParse(property.roommates),
+          rules: safeJsonParse(property.rules),
+          price_range: safeJsonParse(property.price_range),
+          bills_inclusive: safeJsonParse(property.bills_inclusive)
+        };
+        return res.json(processedProperty);
+      }
+
+      // Property not found in either table
+      return res.status(404).json({ 
+        error: 'Property not found' 
+      });
+    });
+  });
+});
+
+// POST /api/admin/approve-property/:id
+// Approve a pending property listing
 router.post('/approve-property/:id', auth, requireAdminRole, (req, res) => {
   const propertyId = req.params.id;
   const adminId = req.user.id;
@@ -207,7 +281,7 @@ router.post('/approve-property/:id', auth, requireAdminRole, (req, res) => {
               });
             }
 
-            // Commit the transaction - all changes are now permanent
+            // Commit the transaction
             connection.commit((err) => {
               if (err) {
                 return connection.rollback(() => {
@@ -219,14 +293,11 @@ router.post('/approve-property/:id', auth, requireAdminRole, (req, res) => {
 
               connection.release();
               
-              // Success! The property is now live on the platform
               res.json({ 
                 msg: 'Property approved successfully',
                 propertyId: propertyId,
                 approvedBy: adminId
               });
-
-              // TODO: notification logic to inform the property owner
             });
           });
         });
@@ -235,10 +306,8 @@ router.post('/approve-property/:id', auth, requireAdminRole, (req, res) => {
   });
 });
 
-/**
- * POST /api/admin/reject-property/:id
- * Reject a pending property listing with a reason
- */
+// POST /api/admin/reject-property/:id
+// Reject a pending property listing with a reason
 router.post('/reject-property/:id', auth, requireAdminRole, (req, res) => {
   const propertyId = req.params.id;
   const { rejection_reason } = req.body;
@@ -281,15 +350,11 @@ router.post('/reject-property/:id', auth, requireAdminRole, (req, res) => {
       propertyId: propertyId,
       rejectionReason: rejection_reason
     });
-
-    // TODO: Add notification logic to inform the property owner about the rejection
   });
 });
 
-/**
- * POST /api/admin/remove-property/:id
- * Remove an approved property from public view
- */
+// POST /api/admin/remove-property/:id
+// Remove an approved property from public view
 router.post('/remove-property/:id', auth, requireAdminRole, (req, res) => {
   const propertyId = req.params.id;
   const { removal_reason } = req.body;
@@ -334,12 +399,9 @@ router.post('/remove-property/:id', auth, requireAdminRole, (req, res) => {
   });
 });
 
-/**
- * GET /api/admin/stats
- * Get dashboard statistics for admin overview
- */
+// GET /api/admin/stats
+// Get dashboard statistics for admin overview
 router.get('/stats', auth, requireAdminRole, (req, res) => {
-  // Use Promise.all to run multiple queries concurrently for better performance
   const queries = {
     pendingCount: new Promise((resolve, reject) => {
       db.query(
@@ -401,9 +463,7 @@ router.get('/stats', auth, requireAdminRole, (req, res) => {
     });
 });
 
-/**
- * Utility function to safely parse JSON strings
- */
+// Utility function to safely parse JSON strings
 function safeJsonParse(jsonString) {
   if (!jsonString) return null;
   try {
