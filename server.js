@@ -9,7 +9,9 @@ dotenv.config();
 const authRoutes = require('./routes/auth');
 const propertyRoutes = require('./routes/properties');
 const userInteractionsRouter = require('./routes/userInteractions');
-const adminRoutes = require('./routes/admin'); // NEW: Admin routes for our three-tier system
+const adminRoutes = require('./routes/admin'); 
+const profileRoutes = require('./routes/profile');
+
 
 const app = express();
 
@@ -22,7 +24,8 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/properties', propertyRoutes); 
 app.use('/api/user-interactions', userInteractionsRouter);
-app.use('/api/admin', adminRoutes); // NEW: Mount admin routes
+app.use('/api/admin', adminRoutes); 
+app.use('/api/profile', profileRoutes);
 
 // Health check endpoint for monitoring
 app.get('/health', (req, res) => {

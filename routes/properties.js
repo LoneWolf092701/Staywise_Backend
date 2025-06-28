@@ -321,24 +321,61 @@ router.delete('/details/:id', auth, (req, res) => {
 
 // to get all properties
 router.get('/all', (req, res) => {
-  db.query('SELECT * FROM all_properties', (err, results) => {
+  const query = `
+    SELECT * FROM all_properties 
+    WHERE is_active = 1 
+    ORDER BY approved_at DESC
+  `;
+  
+  db.query(query, (err, results) => {
     if (err) {
       console.error('Error fetching all properties:', err);
       return res.status(500).json({ error: 'Error fetching all properties' });
     }
-    res.json(results);
+  const processedResults = results.map(property => ({
+      ...property,
+      amenities: safeJsonParse(property.amenities),
+      facilities: safeJsonParse(property.facilities),
+      roommates: safeJsonParse(property.roommates),
+      rules: safeJsonParse(property.rules),
+      price_range: safeJsonParse(property.price_range),
+      bills_inclusive: safeJsonParse(property.bills_inclusive)
+    }));
+    
+    res.json(processedResults);
   });
 });
 
 // to get one property
 router.get('/all/:id', (req, res) => {
   const propertyId = req.params.id;
-  db.query('SELECT * FROM all_properties WHERE id = ?', [propertyId], (err, results) => {
+  const query = `
+    SELECT * FROM all_properties 
+    WHERE id = ? AND is_active = 1
+  `;
+  
+  db.query(query, [propertyId], (err, results) => {
     if (err) {
       console.error('Error fetching property detail:', err);
       return res.status(500).json({error: 'Error fetching property details'});
     }
-    res.json(results);
+    
+    if (results.length === 0) {
+      return res.status(404).json({error: 'Property not found or not available'});
+    }
+    
+    // Process the single property result
+    const processedResult = results.map(property => ({
+      ...property,
+      amenities: safeJsonParse(property.amenities),
+      facilities: safeJsonParse(property.facilities),
+      roommates: safeJsonParse(property.roommates),
+      rules: safeJsonParse(property.rules),
+      price_range: safeJsonParse(property.price_range),
+      bills_inclusive: safeJsonParse(property.bills_inclusive)
+    }));
+    
+    res.json(processedResult);
   })
 });
 
@@ -353,5 +390,15 @@ router.post('/upload', auth, upload.single('image'), async (req, res) => {
     res.status(500).json({ error: 'Image upload failed', details: error });
   }
 });
+
+function safeJsonParse(jsonString) {
+  if (!jsonString) return null;
+  try {
+    return JSON.parse(jsonString);
+  } catch (error) {
+    console.warn('Invalid JSON string:', jsonString);
+    return null;
+  }
+}
 
 module.exports = router;
