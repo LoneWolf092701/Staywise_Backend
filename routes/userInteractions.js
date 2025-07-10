@@ -371,16 +371,18 @@ router.get('/favourites', auth, (req, res) => {
   const offset = (page - 1) * limit;
 
   // Get favourite properties with property details
+  // Fixed query: Join with user_profiles table to get owner information
   const query = `
     SELECT 
       p.*,
-      u.name as owner_name,
-      u.phone as owner_phone,
+      CONCAT(up.first_name, ' ', up.last_name) as owner_name,
+      up.phone as owner_phone,
       u.email as owner_email,
       ui.updated_at as favourited_at
     FROM user_property_interactions ui
     JOIN all_properties p ON ui.property_id = p.id
     JOIN users u ON p.user_id = u.id
+    LEFT JOIN user_profiles up ON u.id = up.user_id
     WHERE ui.user_id = ? 
       AND ui.isFavourite = 1 
       AND p.is_active = 1
@@ -413,6 +415,8 @@ router.get('/favourites', auth, (req, res) => {
         // Process results to ensure proper JSON parsing
         const processedResults = results.map(property => ({
           ...property,
+          // Clean up the owner_name field (remove extra spaces)
+          owner_name: property.owner_name ? property.owner_name.trim().replace(/\s+/g, ' ') : '',
           images: safeJsonParse(property.images) || [],
           facilities: safeJsonParse(property.facilities) || {},
           amenities: safeJsonParse(property.amenities) || [],
