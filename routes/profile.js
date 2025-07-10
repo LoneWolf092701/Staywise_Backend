@@ -3,7 +3,103 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const auth = require('../middleware/auth');
 const db = require('../config/db');
-const { upload } = require('../middleware/upload');
+const { upload, uploadToCloudinary } = require('../middleware/upload');
+
+// Helper function to validate profile data based on user role
+function validateProfileData(profileData, userRole) {
+  const { username, email } = profileData;
+  
+  if (!username || username.trim().length < 3) {
+    return { 
+      isValid: false, 
+      message: 'Username must be at least 3 characters long',
+      field: 'username' 
+    };
+  }
+  
+  if (!email || !email.includes('@')) {
+    return { 
+      isValid: false, 
+      message: 'Valid email address is required',
+      field: 'email' 
+    };
+  }
+
+  // Role-specific validation
+  if (userRole === 'user') {
+    const { firstName, lastName } = profileData;
+    if (!firstName || firstName.trim().length < 1) {
+      return { 
+        isValid: false, 
+        message: 'First name is required for users',
+        field: 'firstName' 
+      };
+    }
+    if (!lastName || lastName.trim().length < 1) {
+      return { 
+        isValid: false, 
+        message: 'Last name is required for users',
+        field: 'lastName' 
+      };
+    }
+  } else if (userRole === 'propertyowner') {
+    const { businessName, contactPerson } = profileData;
+    if (!businessName || businessName.trim().length < 1) {
+      return { 
+        isValid: false, 
+        message: 'Business name is required for property owners',
+        field: 'businessName' 
+      };
+    }
+    if (!contactPerson || contactPerson.trim().length < 1) {
+      return { 
+        isValid: false, 
+        message: 'Contact person is required for property owners',
+        field: 'contactPerson' 
+      };
+    }
+  }
+
+  return { isValid: true };
+}
+
+// Helper function to build profile fields based on user role
+function buildProfileFields(profileData, userRole) {
+  const baseFields = {
+    phone: profileData.phone || null,
+    profile_image: profileData.profileImage || null
+  };
+
+  if (userRole === 'user') {
+    return {
+      ...baseFields,
+      first_name: profileData.firstName || null,
+      last_name: profileData.lastName || null,
+      gender: profileData.gender || null,
+      birthdate: profileData.birthdate || null,
+      nationality: profileData.nationality || null
+    };
+  } else if (userRole === 'propertyowner') {
+    return {
+      ...baseFields,
+      business_name: profileData.businessName || null,
+      contact_person: profileData.contactPerson || null,
+      business_type: profileData.businessType || null,
+      business_registration: profileData.businessRegistration || null,
+      business_address: profileData.businessAddress || null
+    };
+  } else if (userRole === 'admin') {
+    return {
+      ...baseFields,
+      first_name: profileData.firstName || null,
+      last_name: profileData.lastName || null,
+      department: profileData.department || null,
+      admin_level: profileData.adminLevel || null
+    };
+  }
+
+  return baseFields;
+}
 
 /**
  * GET /api/profile
@@ -150,6 +246,7 @@ router.put('/', auth, (req, res) => {
         
         // Check if profile exists, then insert or update accordingly
         const checkProfileQuery = 'SELECT user_id FROM user_profiles WHERE user_id = ?';
+        
         connection.query(checkProfileQuery, [userId], (err, results) => {
           if (err) {
             return connection.rollback(() => {
@@ -243,6 +340,7 @@ router.put('/password', auth, async (req, res) => {
   try {
     // Get current user data to verify current password
     const getUserQuery = 'SELECT password FROM users WHERE id = ?';
+    
     db.query(getUserQuery, [userId], async (err, results) => {
       if (err) {
         console.error('Error fetching user for password change:', err);
@@ -268,20 +366,17 @@ router.put('/password', auth, async (req, res) => {
       const saltRounds = 10;
       const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
 
-      // Update password in database
+      // Update password
       const updatePasswordQuery = `
         UPDATE users 
-        SET password = ?, updated_at = NOW() 
+        SET password = ?, updated_at = NOW()
         WHERE id = ?
       `;
 
       db.query(updatePasswordQuery, [hashedNewPassword, userId], (err) => {
         if (err) {
           console.error('Error updating password:', err);
-          return res.status(500).json({ 
-            error: 'Error updating password',
-            details: err.message 
-          });
+          return res.status(500).json({ error: 'Error updating password' });
         }
 
         res.json({ 
@@ -292,197 +387,171 @@ router.put('/password', auth, async (req, res) => {
     });
   } catch (error) {
     console.error('Error in password change process:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: 'An unexpected error occurred while changing password'
-    });
+    res.status(500).json({ error: 'Error processing password change' });
   }
 });
 
 /**
  * POST /api/profile/image
- * Upload a profile image for the current user
+ * Upload a profile picture for the current user
  */
 router.post('/image', auth, upload.single('profileImage'), async (req, res) => {
-  const userId = req.user.id;
-
   if (!req.file) {
+    return res.status(400).json({ error: 'No image file uploaded' });
+  }
+
+  try {
+    const userId = req.user.id;
+    
+    // Upload to cloudinary
+    const result = await uploadToCloudinary(req.file.buffer, req.file.originalname);
+    
+    // Update user profile with new image URL
+    const updateQuery = `
+      INSERT INTO user_profiles (user_id, profile_image, created_at, updated_at) 
+      VALUES (?, ?, NOW(), NOW())
+      ON DUPLICATE KEY UPDATE 
+      profile_image = VALUES(profile_image), 
+      updated_at = NOW()
+    `;
+
+    db.query(updateQuery, [userId, result.secure_url], (err) => {
+      if (err) {
+        console.error('Error updating profile image:', err);
+        return res.status(500).json({ error: 'Error saving profile image' });
+      }
+
+      res.json({
+        message: 'Profile image uploaded successfully',
+        imageUrl: result.secure_url
+      });
+    });
+
+  } catch (error) {
+    console.error('Error uploading profile image:', error);
+    res.status(500).json({ error: 'Error uploading image' });
+  }
+});
+
+/**
+ * DELETE /api/profile
+ * Delete the current user's account (with password confirmation)
+ */
+router.delete('/', auth, async (req, res) => {
+  const userId = req.user.id;
+  const userRole = req.user.role;
+  const { password } = req.body;
+
+  if (!password) {
     return res.status(400).json({ 
-      error: 'No image file provided',
-      message: 'Please select an image file to upload'
+      error: 'Password confirmation is required',
+      message: 'Please provide your current password to delete your account'
+    });
+  }
+
+  // Prevent admin account deletion via this route
+  if (userRole === 'admin') {
+    return res.status(403).json({ 
+      error: 'Admin accounts cannot be deleted via this route',
+      message: 'Please contact system administrator for account management'
     });
   }
 
   try {
-    // Here you would typically upload to a cloud service like Cloudinary
-    // For now, we'll just store the file path
-    const imageUrl = `/uploads/profiles/${req.file.filename}`;
-
-    // Update user profile with new image URL
-    const updateImageQuery = `
-      INSERT INTO user_profiles (user_id, profile_image, created_at, updated_at)
-      VALUES (?, ?, NOW(), NOW())
-      ON DUPLICATE KEY UPDATE 
-        profile_image = VALUES(profile_image),
-        updated_at = NOW()
-    `;
-
-    db.query(updateImageQuery, [userId, imageUrl], (err) => {
+    // Verify password
+    const getUserQuery = 'SELECT password FROM users WHERE id = ?';
+    
+    db.query(getUserQuery, [userId], async (err, results) => {
       if (err) {
-        console.error('Error updating profile image:', err);
-        return res.status(500).json({ 
-          error: 'Error saving profile image',
-          details: err.message 
+        console.error('Error fetching user for deletion:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const user = results[0];
+      
+      // Verify password
+      const isPasswordValid = await bcrypt.compare(password, user.password);
+      if (!isPasswordValid) {
+        return res.status(401).json({ 
+          error: 'Password is incorrect',
+          message: 'Please enter your current password correctly'
         });
       }
 
-      res.json({ 
-        message: 'Profile image uploaded successfully',
-        imageUrl: imageUrl
+      // Delete user (CASCADE will handle related records)
+      const deleteQuery = 'DELETE FROM users WHERE id = ?';
+      
+      db.query(deleteQuery, [userId], (err) => {
+        if (err) {
+          console.error('Error deleting user account:', err);
+          return res.status(500).json({ error: 'Error deleting account' });
+        }
+
+        res.json({ 
+          message: 'Account deleted successfully',
+          deletedAt: new Date().toISOString()
+        });
       });
     });
   } catch (error) {
-    console.error('Error uploading profile image:', error);
-    res.status(500).json({ 
-      error: 'Error processing image upload',
-      message: 'An unexpected error occurred while uploading the image'
-    });
+    console.error('Error in account deletion process:', error);
+    res.status(500).json({ error: 'Error processing account deletion' });
   }
 });
 
 /**
  * GET /api/profile/stats
- * Get profile statistics (mainly for property owners)
+ * Get profile statistics for property owners
  */
 router.get('/stats', auth, (req, res) => {
   const userId = req.user.id;
   const userRole = req.user.role;
 
-  if (userRole === 'propertyowner') {
-    // Get property owner statistics
-    const statsQueries = {
-      totalProperties: 'SELECT COUNT(*) as count FROM property_details WHERE user_id = ? AND is_deleted = 0',
-      approvedProperties: 'SELECT COUNT(*) as count FROM all_properties WHERE user_id = ? AND is_active = 1',
-      pendingProperties: 'SELECT COUNT(*) as count FROM property_details WHERE user_id = ? AND approval_status = "pending" AND is_deleted = 0',
-      rejectedProperties: 'SELECT COUNT(*) as count FROM property_details WHERE user_id = ? AND approval_status = "rejected" AND is_deleted = 0'
-    };
-
-    const stats = {};
-    let completedQueries = 0;
-    const totalQueries = Object.keys(statsQueries).length;
-
-    Object.entries(statsQueries).forEach(([key, query]) => {
-      db.query(query, [userId], (err, results) => {
-        if (err) {
-          console.error(`Error fetching ${key}:`, err);
-          stats[key] = 0;
-        } else {
-          stats[key] = results[0].count;
-        }
-
-        completedQueries++;
-        if (completedQueries === totalQueries) {
-          res.json(stats);
-        }
-      });
+  if (userRole !== 'propertyowner') {
+    return res.status(403).json({ 
+      error: 'Access denied',
+      message: 'Statistics are only available for property owners'
     });
-  } else if (userRole === 'user') {
-    // Get user statistics (favorites, etc.)
-    const userStatsQuery = `
-      SELECT 
-        COUNT(CASE WHEN isFavourite = 1 THEN 1 END) as favoriteProperties,
-        COUNT(CASE WHEN complaint IS NOT NULL THEN 1 END) as complaintsSubmitted
-      FROM user_property_interactions 
-      WHERE user_id = ?
-    `;
+  }
 
-    db.query(userStatsQuery, [userId], (err, results) => {
-      if (err) {
-        console.error('Error fetching user stats:', err);
-        return res.status(500).json({ error: 'Error fetching statistics' });
-      }
+  // Get various statistics for property owner
+  const statsQuery = `
+    SELECT 
+      (SELECT COUNT(*) FROM property_details WHERE user_id = ? AND is_deleted = 0) as total_properties,
+      (SELECT COUNT(*) FROM property_details WHERE user_id = ? AND approval_status = 'approved' AND is_deleted = 0) as approved_properties,
+      (SELECT COUNT(*) FROM property_details WHERE user_id = ? AND approval_status = 'pending' AND is_deleted = 0) as pending_properties,
+      (SELECT COUNT(*) FROM booking_requests WHERE property_owner_id = ?) as total_bookings,
+      (SELECT COUNT(*) FROM booking_requests WHERE property_owner_id = ? AND status = 'confirmed') as confirmed_bookings,
+      (SELECT COALESCE(SUM(views_count), 0) FROM all_properties WHERE user_id = ?) as total_views
+  `;
 
-      res.json(results[0] || { favoriteProperties: 0, complaintsSubmitted: 0 });
-    });
-  } else {
-    // Admin or other roles - basic account stats
+  db.query(statsQuery, [userId, userId, userId, userId, userId, userId], (err, results) => {
+    if (err) {
+      console.error('Error fetching profile stats:', err);
+      return res.status(500).json({ error: 'Error fetching statistics' });
+    }
+
+    const stats = results[0];
+    
     res.json({
-      accountCreated: new Date().toISOString(),
-      role: userRole,
-      lastLogin: new Date().toISOString()
+      properties: {
+        total: stats.total_properties,
+        approved: stats.approved_properties,
+        pending: stats.pending_properties
+      },
+      bookings: {
+        total: stats.total_bookings,
+        confirmed: stats.confirmed_bookings
+      },
+      engagement: {
+        totalViews: stats.total_views
+      }
     });
-  }
+  });
 });
-
-/**
- * Helper function to validate profile data based on user role
- */
-function validateProfileData(data, role) {
-  // Common validations
-  if (!data.username || data.username.trim().length < 3) {
-    return { isValid: false, message: 'Username must be at least 3 characters long', field: 'username' };
-  }
-
-  if (!data.email || !isValidEmail(data.email)) {
-    return { isValid: false, message: 'Please provide a valid email address', field: 'email' };
-  }
-
-  // Role-specific validations
-  if (role === 'user') {
-    if (!data.firstName || data.firstName.trim().length < 2) {
-      return { isValid: false, message: 'First name must be at least 2 characters long', field: 'firstName' };
-    }
-    if (!data.lastName || data.lastName.trim().length < 2) {
-      return { isValid: false, message: 'Last name must be at least 2 characters long', field: 'lastName' };
-    }
-  } else if (role === 'propertyowner') {
-    if (!data.businessName || data.businessName.trim().length < 3) {
-      return { isValid: false, message: 'Business name must be at least 3 characters long', field: 'businessName' };
-    }
-    if (!data.contactPerson || data.contactPerson.trim().length < 2) {
-      return { isValid: false, message: 'Contact person name must be at least 2 characters long', field: 'contactPerson' };
-    }
-  }
-
-  return { isValid: true };
-}
-
-/**
- * Helper function to build profile fields object based on role
- */
-function buildProfileFields(data, role) {
-  const fields = {
-    phone: data.phone || null
-  };
-
-  if (role === 'user') {
-    fields.first_name = data.firstName || null;
-    fields.last_name = data.lastName || null;
-    fields.gender = data.gender || null;
-    fields.birthdate = data.birthdate || null;
-    fields.nationality = data.nationality || null;
-  } else if (role === 'propertyowner') {
-    fields.business_name = data.businessName || null;
-    fields.contact_person = data.contactPerson || null;
-    fields.business_type = data.businessType || null;
-    fields.business_registration = data.businessRegistration || null;
-    fields.business_address = data.businessAddress || null;
-  } else if (role === 'admin') {
-    fields.first_name = data.firstName || null;
-    fields.last_name = data.lastName || null;
-    fields.department = data.department || null;
-    fields.admin_level = data.adminLevel || null;
-  }
-
-  return fields;
-}
-
-/**
- * Helper function to validate email format
- */
-function isValidEmail(email) {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
-}
 
 module.exports = router;

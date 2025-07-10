@@ -1,63 +1,80 @@
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
-const db = require('./config/db');
-
-dotenv.config();
-
-// Import all route modules
-const authRoutes = require('./routes/auth');
-const propertyRoutes = require('./routes/properties');
-const userInteractionsRouter = require('./routes/userInteractions');
-const adminRoutes = require('./routes/admin'); 
-const profileRoutes = require('./routes/profile');
-
+const path = require('path');
+require('dotenv').config();
 
 const app = express();
 
-// Middleware setup
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Middleware
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
 
-// Route mounting - the order matters for proper request handling
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Serve static files from uploads directory
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Import route files
+const authRoutes = require('./routes/auth');
+const propertiesRoutes = require('./routes/properties');
+const profileRoutes = require('./routes/profile');
+const adminRoutes = require('./routes/admin');
+const bookingsRoutes = require('./routes/bookings');
+const userInteractionsRoutes = require('./routes/userInteractions');
+
+// Register API routes
 app.use('/api/auth', authRoutes);
-app.use('/api/properties', propertyRoutes); 
-app.use('/api/user-interactions', userInteractionsRouter);
-app.use('/api/admin', adminRoutes); 
+app.use('/api/properties', propertiesRoutes);
 app.use('/api/profile', profileRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/bookings', bookingsRoutes);
+app.use('/api/user-interactions', userInteractionsRoutes);
 
-// Health check endpoint for monitoring
-app.get('/health', (req, res) => {
-  res.status(200).json({ 
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    environment: process.env.NODE_ENV || 'development'
   });
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
-  });
-});
-
-// 404 handler for unmatched routes
-app.use('*', (req, res) => {
+// Catch-all route for undefined API endpoints
+app.use('/api/*', (req, res) => {
   res.status(404).json({ 
     error: 'Route not found',
-    path: req.originalUrl,
-    method: req.method
+    message: `Route ${req.method} ${req.originalUrl} not found`,
+    availableRoutes: ['/api/auth', '/api/properties', '/api/user-interactions', '/api/admin', '/api/profile'],
+    suggestion: 'Check the API documentation at /api/docs for available endpoints'
   });
 });
 
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err.stack);
+  
+  res.status(err.status || 500).json({
+    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
+  });
+});
+
+// Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server started on port ${PORT}`);
-  console.log(`📊 Admin routes available at: http://localhost:${PORT}/api/admin`);
-  console.log(`🏠 Property routes available at: http://localhost:${PORT}/api/properties`);
-  console.log(`🔐 Auth routes available at: http://localhost:${PORT}/api/auth`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🌐 CORS enabled for: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+  console.log(`📋 Available routes:`);
+  console.log(`   - /api/auth (Authentication)`);
+  console.log(`   - /api/properties (Property management)`);
+  console.log(`   - /api/user-interactions (Ratings, Favorites, Complaints)`);
+  console.log(`   - /api/admin (Admin functions)`);
+  console.log(`   - /api/profile (User profiles)`);
+  console.log(`   - /api/bookings (Booking requests)`);
 });
+
+module.exports = app;
