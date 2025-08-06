@@ -1,434 +1,328 @@
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
-const path = require('path');
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const morgan = require('morgan');
+require('dotenv').config();
 
-// Load environment variables first
-dotenv.config();
+const { initializeDatabase, gracefulShutdown, healthCheck } = require('./config/db');
 
-// Import database connection
-const db = require('./config/db');
-
-// Import all route modules
 const authRoutes = require('./routes/auth');
 const propertyRoutes = require('./routes/properties');
-const userInteractionsRouter = require('./routes/userInteractions');
-const adminRoutes = require('./routes/admin'); 
+const userInteractionRoutes = require('./routes/userInteractions');
+const adminRoutes = require('./routes/admin');
 const profileRoutes = require('./routes/profile');
 const bookingRoutes = require('./routes/bookings');
 
 const app = express();
 
-// Trust proxy for accurate IP addresses (essential for rate limiting and logging)
-app.set('trust proxy', 1);
-
-// Rate limiting middleware - prevents abuse and DOS attacks
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: {
-    error: 'Too many requests',
-    message: 'Please try again later',
-    retryAfter: '15 minutes'
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-// Apply rate limiting to all requests
-app.use(limiter);
-
-// CORS configuration with security considerations
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or Postman)
-    if (!origin) return callback(null, true);
-    
-    const allowedOrigins = [
-      process.env.CLIENT_URL || 'http://localhost:3000',
-      'http://localhost:3000',
-      'http://localhost:3001' // For development testing
-    ];
-    
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: process.env.CLIENT_URL || 'http://localhost:3000',
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-csrf-token'],
-  exposedHeaders: ['x-csrf-token']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['X-Token-Warning']
 }));
 
-// Body parsing with size limits and security
-app.use(express.json({ 
-  limit: '10mb',
-  // Add JSON parsing error handler
-  verify: (req, res, buf) => {
-    try {
-      JSON.parse(buf);
-    } catch (e) {
-      res.status(400).json({
-        error: 'Invalid JSON',
-        message: 'Request body contains malformed JSON'
-      });
-      throw new Error('Invalid JSON');
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false
+}));
+
+app.use(compression());
+
+app.use(morgan('combined', {
+  stream: {
+    write: (message) => {
+      console.log(`[${new Date().toISOString()}] ${message.trim()}`);
     }
   }
 }));
 
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: {
+    error: 'Too many requests',
+    message: 'Too many requests from this IP, please try again later.',
+    retryAfter: '15 minutes'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    console.log(`Rate limit exceeded for IP: ${req.ip}`);
+    res.status(429).json({
+      error: 'Too many requests',
+      message: 'Too many requests from this IP, please try again later.',
+      retryAfter: '15 minutes'
+    });
+  }
+});
+
+app.use(limiter);
+
+app.use(express.json({ 
+  limit: '10mb',
+  strict: true
+}));
 app.use(express.urlencoded({ 
   extended: true, 
   limit: '10mb' 
 }));
 
-// Request ID middleware for better error tracking
 app.use((req, res, next) => {
-  req.id = Date.now().toString(36) + Math.random().toString(36).substr(2);
+  const requestId = Math.random().toString(36).substring(2, 15);
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
   next();
 });
 
-// Request logging middleware with security headers
 app.use((req, res, next) => {
-  const timestamp = new Date().toISOString();
   const userAgent = req.get('User-Agent') || 'Unknown';
-  
-  console.log(`[${timestamp}] ${req.method} ${req.path} - IP: ${req.ip} - ID: ${req.id} - Agent: ${userAgent}`);
-  
-  // Add security headers
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  
+  const ip = req.ip || req.connection.remoteAddress || 'Unknown';
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} - IP: ${ip} - ID: ${req.requestId} - Agent: ${userAgent}`);
   next();
 });
 
-// Health check endpoint with detailed status information
-app.get('/health', (req, res) => {
-  // Test database connection
-  db.query('SELECT 1', (err) => {
-    const healthStatus = {
-      status: err ? 'ERROR' : 'OK',
+app.use('/api/auth', authRoutes);
+app.use('/api/properties', propertyRoutes);
+app.use('/api/user-interactions', userInteractionRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/profile', profileRoutes);
+app.use('/api/bookings', bookingRoutes);
+
+app.get('/health', async (req, res) => {
+  try {
+    const dbHealth = await healthCheck();
+    const serverHealth = {
+      status: 'healthy',
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
-      environment: process.env.NODE_ENV || 'development',
-      version: process.env.npm_package_version || '1.0.0',
-      database: err ? 'disconnected' : 'connected'
+      memory: process.memoryUsage(),
+      environment: process.env.NODE_ENV || 'development'
     };
 
-    if (err) {
-      console.error('Health check database error:', err);
-      return res.status(503).json(healthStatus);
-    }
+    res.json({
+      server: serverHealth,
+      database: dbHealth,
+      overall: dbHealth.status === 'healthy' ? 'healthy' : 'degraded'
+    });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(503).json({
+      server: {
+        status: 'unhealthy',
+        error: error.message,
+        timestamp: new Date().toISOString()
+      },
+      database: {
+        status: 'unknown'
+      },
+      overall: 'unhealthy'
+    });
+  }
+});
 
-    res.status(200).json(healthStatus);
+app.get('/api/docs', (req, res) => {
+  res.json({
+    title: 'StayWise API Documentation',
+    version: '1.0.0',
+    description: 'REST API for StayWise property management platform',
+    endpoints: {
+      authentication: {
+        'POST /api/auth/register': 'Register a new user',
+        'POST /api/auth/login': 'Login user',
+        'POST /api/auth/forgot-password': 'Request password reset',
+        'POST /api/auth/reset-password': 'Reset password with token',
+        'POST /api/auth/change-password': 'Change password (authenticated)',
+        'POST /api/auth/verify-email': 'Verify email address',
+        'POST /api/auth/resend-verification': 'Resend verification email'
+      },
+      properties: {
+        'GET /api/properties': 'Get all approved properties',
+        'GET /api/properties/search': 'Search properties with filters',
+        'GET /api/properties/:id': 'Get property by ID',
+        'POST /api/properties': 'Create new property (property owner)',
+        'PUT /api/properties/:id': 'Update property (owner/admin)',
+        'DELETE /api/properties/:id': 'Delete property (owner/admin)',
+        'GET /api/properties/owner/mine': 'Get properties owned by current user'
+      },
+      userInteractions: {
+        'POST /api/user-interactions/favorite': 'Add/remove property favorite',
+        'POST /api/user-interactions/rating': 'Rate a property',
+        'POST /api/user-interactions/complaint': 'Submit property complaint',
+        'POST /api/user-interactions/view': 'Track property view',
+        'GET /api/user-interactions/favorites': 'Get user favorites',
+        'GET /api/user-interactions/ratings': 'Get user ratings'
+      },
+      admin: {
+        'GET /api/admin/users': 'Get all users (admin)',
+        'GET /api/admin/properties/pending': 'Get pending properties',
+        'PUT /api/admin/properties/:id/approve': 'Approve property',
+        'PUT /api/admin/properties/:id/reject': 'Reject property',
+        'GET /api/admin/complaints': 'Get all complaints',
+        'PUT /api/admin/complaints/:id': 'Update complaint status'
+      },
+      profile: {
+        'GET /api/profile': 'Get user profile',
+        'PUT /api/profile': 'Update user profile',
+        'POST /api/profile/avatar': 'Upload profile avatar'
+      },
+      bookings: {
+        'POST /api/bookings': 'Create booking request',
+        'GET /api/bookings': 'Get user bookings',
+        'GET /api/bookings/owner': 'Get bookings for property owner',
+        'PUT /api/bookings/:id/status': 'Update booking status'
+      }
+    },
+    authentication: 'Bearer token required for protected endpoints',
+    rateLimit: '100 requests per 15 minutes per IP'
   });
 });
 
-// API information endpoint with comprehensive documentation
-app.get('/api', (req, res) => {
+app.get('/', (req, res) => {
   res.json({
-    message: 'StayWise Property Rental API',
+    message: 'StayWise API Server',
     version: '1.0.0',
-    environment: process.env.NODE_ENV || 'development',
-    endpoints: {
-      auth: '/api/auth',
-      properties: '/api/properties',
-      userInteractions: '/api/user-interactions',
-      admin: '/api/admin',
-      profile: '/api/profile',
-      bookings: '/api/bookings'
-    },
+    status: 'active',
     documentation: '/api/docs',
     health: '/health'
   });
 });
 
-// API documentation endpoint
-app.get('/api/docs', (req, res) => {
-  res.json({
-    title: 'StayWise API Documentation',
-    version: '1.0.0',
-    description: 'REST API for StayWise Property Rental Platform',
-    baseURL: `${req.protocol}://${req.get('host')}/api`,
-    authentication: 'Bearer Token (JWT)',
-    rateLimit: '100 requests per 15 minutes per IP',
-    endpoints: {
-      // Authentication endpoints
-      'POST /auth/register': {
-        description: 'Register new user',
-        authentication: false,
-        body: ['username', 'email', 'password', 'role?']
-      },
-      'POST /auth/login': {
-        description: 'User login',
-        authentication: false,
-        body: ['username', 'password']
-      },
-      'POST /auth/forgot-password': {
-        description: 'Initiate password reset',
-        authentication: false,
-        body: ['email']
-      },
-      'POST /auth/reset-password': {
-        description: 'Reset password with token',
-        authentication: false,
-        body: ['token', 'newPassword', 'confirmPassword']
-      },
-      'GET /auth/verify-token': {
-        description: 'Verify JWT token',
-        authentication: true
-      },
-      
-      // Property endpoints
-      'GET /properties/public': {
-        description: 'Get all public properties',
-        authentication: false
-      },
-      'GET /properties/public/:id': {
-        description: 'Get specific public property',
-        authentication: false
-      },
-      'POST /properties/details': {
-        description: 'Add property details',
-        authentication: true,
-        role: 'propertyowner'
-      },
-      'GET /properties/details': {
-        description: 'Get user properties',
-        authentication: true,
-        role: 'propertyowner'
-      },
-      'PUT /properties/details/:id': {
-        description: 'Update property',
-        authentication: true,
-        role: 'propertyowner'
-      },
-      
-      // User interaction endpoints
-      'POST /user-interactions/favourite': {
-        description: 'Set/update favourite status',
-        authentication: true
-      },
-      'GET /user-interactions/favourites': {
-        description: 'Get user favourites',
-        authentication: true
-      },
-      
-      // Booking endpoints
-      'POST /bookings/request': {
-        description: 'Submit booking request',
-        authentication: true,
-        role: 'user'
-      },
-      'GET /bookings/user': {
-        description: 'Get user bookings',
-        authentication: true,
-        role: 'user'
-      },
-      'GET /bookings/owner': {
-        description: 'Get property owner bookings',
-        authentication: true,
-        role: 'propertyowner'
-      },
-      
-      // Profile endpoints
-      'GET /profile': {
-        description: 'Get user profile',
-        authentication: true
-      },
-      'PUT /profile': {
-        description: 'Update user profile',
-        authentication: true
-      },
-      'PUT /profile/password': {
-        description: 'Change password',
-        authentication: true
-      },
-      
-      // Admin endpoints
-      'GET /admin/pending-properties': {
-        description: 'Get pending properties',
-        authentication: true,
-        role: 'admin'
-      },
-      'POST /admin/approve-property/:id': {
-        description: 'Approve property',
-        authentication: true,
-        role: 'admin'
-      }
-    }
-  });
-});
-
-// Route mounting - order is critical for proper request handling
-app.use('/api/auth', authRoutes);
-app.use('/api/properties', propertyRoutes); 
-app.use('/api/user-interactions', userInteractionsRouter);
-app.use('/api/admin', adminRoutes); 
-app.use('/api/profile', profileRoutes);
-app.use('/api/bookings', bookingRoutes);
-
-// Static file serving for production deployment
-if (process.env.NODE_ENV === 'production') {
-  app.use(express.static(path.join(__dirname, 'build')));
-  
-  // Catch-all handler for client-side routing
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'build', 'index.html'));
-  });
-}
-
-// Comprehensive error handling middleware with consistent response format
-app.use((err, req, res, next) => {
-  console.error(`❌ Error [${req.id}]:`, {
-    message: err.message,
-    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
-    url: req.url,
-    method: req.method,
-    ip: req.ip,
-    userAgent: req.get('User-Agent')
-  });
-  
-  // Handle specific error types with appropriate responses
-  if (err.type === 'entity.parse.failed') {
-    return res.status(400).json({ 
-      error: 'Invalid JSON',
-      message: 'Request body contains malformed JSON',
-      requestId: req.id
-    });
-  }
-  
-  if (err.type === 'entity.too.large') {
-    return res.status(413).json({ 
-      error: 'Payload too large',
-      message: 'Request body exceeds maximum allowed size',
-      requestId: req.id
-    });
-  }
-
-  if (err.message === 'Not allowed by CORS') {
-    return res.status(403).json({
-      error: 'CORS policy violation',
-      message: 'Origin not allowed by CORS policy',
-      requestId: req.id
-    });
-  }
-
-  // Default error response with consistent format
-  res.status(err.status || 500).json({ 
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' 
-      ? err.message 
-      : 'An unexpected error occurred. Please try again later.',
-    requestId: req.id,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// 404 handler for unmatched routes with helpful information
 app.use('*', (req, res) => {
-  res.status(404).json({ 
-    error: 'Route not found',
+  res.status(404).json({
+    error: 'Not Found',
     message: `Route ${req.method} ${req.originalUrl} not found`,
-    requestId: req.id,
-    availableRoutes: [
-      '/api/auth',
-      '/api/properties', 
-      '/api/user-interactions',
-      '/api/admin',
-      '/api/profile',
-      '/api/bookings',
-      '/health',
-      '/api',
-      '/api/docs'
-    ],
-    suggestion: 'Check the API documentation at /api/docs for available endpoints'
+    timestamp: new Date().toISOString()
   });
 });
 
-// Server startup with comprehensive configuration display
+app.use((error, req, res, next) => {
+  console.error('Uncaught Exception:', {
+    message: error.message,
+    stack: error.stack,
+    timestamp: new Date().toISOString()
+  });
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  const statusCode = error.statusCode || error.status || 500;
+  const message = error.message || 'Internal Server Error';
+
+  res.status(statusCode).json({
+    error: 'Server Error',
+    message: message,
+    requestId: req.requestId,
+    timestamp: new Date().toISOString()
+  });
+});
+
 const PORT = process.env.PORT || 5000;
-const HOST = process.env.HOST || 'localhost';
+let server;
 
-const server = app.listen(PORT, HOST, () => {
-  console.log('\n🚀 ===== StayWise API Server Started =====');
-  console.log(`📡 Server running on: http://${HOST}:${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📊 Database: ${process.env.DB_NAME || 'staywise_db'}`);
-  console.log(`🔒 Rate limit: 100 requests per 15 minutes per IP`);
-  console.log('\n📋 Available API Endpoints:');
-  console.log(`   🔐 Auth routes: http://${HOST}:${PORT}/api/auth`);
-  console.log(`   🏠 Property routes: http://${HOST}:${PORT}/api/properties`);
-  console.log(`   👤 User interactions: http://${HOST}:${PORT}/api/user-interactions`);
-  console.log(`   📊 Admin routes: http://${HOST}:${PORT}/api/admin`);
-  console.log(`   👨‍💼 Profile routes: http://${HOST}:${PORT}/api/profile`);
-  console.log(`   📅 Booking routes: http://${HOST}:${PORT}/api/bookings`);
-  console.log(`   💚 Health check: http://${HOST}:${PORT}/health`);
-  console.log(`   📚 API docs: http://${HOST}:${PORT}/api/docs`);
-  console.log('\n✅ Server ready to accept connections!');
-});
+const startServer = async () => {
+  try {
+    const dbInitialized = await initializeDatabase();
+    if (!dbInitialized) {
+      console.error('Failed to initialize database. Exiting...');
+      process.exit(1);
+    }
 
-// Graceful shutdown handling with cleanup
-process.on('SIGTERM', () => {
-  console.log('\n🛑 SIGTERM received. Starting graceful shutdown...');
-  server.close(() => {
-    console.log('✅ HTTP server closed');
-    // Close database connections
-    db.end(() => {
-      console.log('✅ Database connections closed');
-      process.exit(0);
+    server = app.listen(PORT, () => {
+      console.log('\n===== StayWise API Server Started =====');
+      console.log(`Server running on: http://localhost:${PORT}`);
+      console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`Database: ${process.env.DB_NAME || 'staywise_db'}`);
+      console.log(`Rate limit: 100 requests per 15 minutes per IP`);
+      console.log('\nAvailable API Endpoints:');
+      console.log(`   Auth routes: http://localhost:${PORT}/api/auth`);
+      console.log(`   Property routes: http://localhost:${PORT}/api/properties`);
+      console.log(`   User interactions: http://localhost:${PORT}/api/user-interactions`);
+      console.log(`   Admin routes: http://localhost:${PORT}/api/admin`);
+      console.log(`   Profile routes: http://localhost:${PORT}/api/profile`);
+      console.log(`   Booking routes: http://localhost:${PORT}/api/bookings`);
+      console.log(`   Health check: http://localhost:${PORT}/health`);
+      console.log(`   API docs: http://localhost:${PORT}/api/docs`);
+      console.log('\nServer ready to accept connections!');
     });
-  });
-});
 
-process.on('SIGINT', () => {
-  console.log('\n🛑 SIGINT received. Starting graceful shutdown...');
-  server.close(() => {
-    console.log('✅ HTTP server closed');
-    // Close database connections
-    db.end(() => {
-      console.log('✅ Database connections closed');
-      process.exit(0);
+    server.on('error', (error) => {
+      if (error.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use. Please use a different port.`);
+      } else {
+        console.error('Server error:', error);
+      }
+      process.exit(1);
     });
-  });
-});
 
-// Error handling for uncaught exceptions
-process.on('uncaughtException', (err) => {
-  console.error('❌ Uncaught Exception:', {
-    message: err.message,
-    stack: err.stack,
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+const handleShutdown = async (signal) => {
+  console.log(`\nReceived ${signal}. Starting graceful shutdown...`);
+  
+  if (server) {
+    server.close(async (err) => {
+      if (err) {
+        console.error('Error closing HTTP server:', err);
+      } else {
+        console.log('HTTP server closed');
+      }
+
+      try {
+        await gracefulShutdown();
+        console.log('Graceful shutdown completed');
+        process.exit(0);
+      } catch (error) {
+        console.error('Error during graceful shutdown:', error);
+        process.exit(1);
+      }
+    });
+
+    setTimeout(() => {
+      console.error('Forced shutdown due to timeout');
+      process.exit(1);
+    }, 10000);
+  } else {
+    process.exit(0);
+  }
+};
+
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', {
+    message: error.message,
+    stack: error.stack,
     timestamp: new Date().toISOString()
   });
   
-  // Attempt graceful shutdown
-  server.close(() => {
-    process.exit(1);
-  });
-  
-  // Force exit after 10 seconds if graceful shutdown fails
-  setTimeout(() => {
-    console.error('❌ Forced exit due to uncaught exception');
-    process.exit(1);
-  }, 10000);
+  handleShutdown('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection:', {
-    reason: reason,
-    promise: promise,
-    timestamp: new Date().toISOString()
-  });
-  
-  // Don't exit the process for unhandled rejections in production
-  if (process.env.NODE_ENV === 'development') {
-    process.exit(1);
-  }
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  handleShutdown('unhandledRejection');
 });
 
-module.exports = app;
+startServer();

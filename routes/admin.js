@@ -1,755 +1,829 @@
 const express = require('express');
 const router = express.Router();
-const auth = require('../middleware/auth');
-const { requireAdmin } = require('../middleware/auth');
-const db = require('../config/db');
+const { query, executeTransaction } = require('../config/db');
+const { auth, requireAdmin } = require('../middleware/auth');
 
-function safeJsonParse(jsonString) {
-  if (!jsonString) return null;
-  try {
-    return JSON.parse(jsonString);
-  } catch (error) {
-    console.warn('Invalid JSON string:', jsonString);
-    return null;
+/**
+ * Safe JSON parsing function that handles both JSON and comma-separated string formats
+ * This ensures admin operations can process property data regardless of storage format
+ * @param {string|null} value - The value to parse (JSON string or comma-separated string)
+ * @returns {Array} Array of parsed values
+ */
+const safeJsonParse = (value) => {
+  if (!value) return [];
+  
+  // If already an array, return it
+  if (Array.isArray(value)) return value;
+  
+  // If it's a string, try to parse as JSON first
+  if (typeof value === 'string') {
+    // Try JSON parsing first
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      // If JSON parsing fails, treat as comma-separated string
+      return value.split(',').map(item => item.trim()).filter(item => item.length > 0);
+    }
   }
-}
-
-const requireAdminRole = (req, res, next) => {
-  if (req.user.role !== 'admin') {
-    const roleRedirects = {
-      user: '/user-home',
-      propertyowner: '/home'
-    };
-    
-    return res.status(403).json({ 
-      error: 'Access denied. Admin role required.',
-      userRole: req.user.role,
-      redirectTo: roleRedirects[req.user.role] || '/login'
-    });
-  }
-  next();
+  
+  return [];
 };
 
-router.get('/pending-properties', auth, requireAdminRole, (req, res) => {
-  const { page = 1, limit = 20, sortBy = 'created_at', sortOrder = 'ASC' } = req.query;
-  const offset = (parseInt(page) - 1) * parseInt(limit);
-
-  const query = `
-    SELECT 
-      pd.*,
-      u.username as owner_username,
-      u.email as owner_email,
-      u.id as owner_id,
-      DATE_FORMAT(pd.created_at, '%Y-%m-%d %H:%i:%s') as submission_date,
-      COUNT(*) OVER() as total_count
-    FROM property_details pd
-    LEFT JOIN users u ON pd.user_id = u.id
-    WHERE pd.approval_status = 'pending' 
-      AND pd.is_deleted = 0
-    ORDER BY pd.${sortBy === 'created_at' ? 'created_at' : 'updated_at'} ${sortOrder === 'DESC' ? 'DESC' : 'ASC'}
-    LIMIT ? OFFSET ?
-  `;
-
-  db.query(query, [parseInt(limit), offset], (err, results) => {
-    if (err) {
-      console.error('Error fetching pending properties:', err);
-      return res.status(500).json({ 
-        error: 'Error fetching pending properties',
-        details: err.message 
-      });
-    }
-
-    const processedResults = results.map(property => ({
-      ...property,
-      amenities: safeJsonParse(property.amenities),
-      facilities: safeJsonParse(property.facilities),
-      roommates: safeJsonParse(property.roommates),
-      rules: safeJsonParse(property.rules),
-      price_range: safeJsonParse(property.price_range),
-      bills_inclusive: safeJsonParse(property.bills_inclusive)
-    }));
-
-    const totalCount = results.length > 0 ? results[0].total_count : 0;
-    const totalPages = Math.ceil(totalCount / parseInt(limit));
-
-    res.json({
-      properties: processedResults,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages,
-        totalCount,
-        hasNext: parseInt(page) < totalPages,
-        hasPrev: parseInt(page) > 1
-      }
-    });
-  });
-});
-
-router.get('/approved-properties', auth, requireAdminRole, (req, res) => {
-  const { page = 1, limit = 20, sortBy = 'created_at', sortOrder = 'DESC' } = req.query;
-  const offset = (parseInt(page) - 1) * parseInt(limit);
-
-  const query = `
-    SELECT 
-      ap.*,
-      u.username as owner_username,
-      u.email as owner_email,
-      u.id as owner_id,
-      DATE_FORMAT(ap.created_at, '%Y-%m-%d %H:%i:%s') as approval_date,
-      COUNT(*) OVER() as total_count
-    FROM all_properties ap
-    LEFT JOIN users u ON ap.user_id = u.id
-    WHERE ap.is_active = 1
-    ORDER BY ap.${sortBy === 'created_at' ? 'created_at' : 'updated_at'} ${sortOrder === 'DESC' ? 'DESC' : 'ASC'}
-    LIMIT ? OFFSET ?
-  `;
-
-  db.query(query, [parseInt(limit), offset], (err, results) => {
-    if (err) {
-      console.error('Error fetching approved properties:', err);
-      return res.status(500).json({ 
-        error: 'Error fetching approved properties',
-        details: err.message 
-      });
-    }
-
-    const processedResults = results.map(property => ({
-      ...property,
-      amenities: safeJsonParse(property.amenities),
-      facilities: safeJsonParse(property.facilities),
-      roommates: safeJsonParse(property.roommates),
-      rules: safeJsonParse(property.rules),
-      price_range: safeJsonParse(property.price_range),
-      bills_inclusive: safeJsonParse(property.bills_inclusive)
-    }));
-
-    const totalCount = results.length > 0 ? results[0].total_count : 0;
-    const totalPages = Math.ceil(totalCount / parseInt(limit));
-
-    res.json({
-      properties: processedResults,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages,
-        totalCount,
-        hasNext: parseInt(page) < totalPages,
-        hasPrev: parseInt(page) > 1
-      }
-    });
-  });
-});
-
-router.get('/property/:id', auth, requireAdminRole, (req, res) => {
-  const propertyId = req.params.id;
-
-  const pendingQuery = `
-    SELECT 
-      pd.*,
-      u.username as owner_username,
-      u.email as owner_email,
-      u.phone as owner_phone,
-      'pending' as source_table
-    FROM property_details pd
-    LEFT JOIN users u ON pd.user_id = u.id
-    WHERE pd.id = ?
-  `;
-
-  db.query(pendingQuery, [propertyId], (err, pendingResults) => {
-    if (err) {
-      console.error('Error fetching property from property_details:', err);
-      return res.status(500).json({ 
-        error: 'Error fetching property details',
-        details: err.message 
-      });
-    }
-
-    if (pendingResults.length > 0) {
-      const property = pendingResults[0];
-      const processedProperty = {
-        ...property,
-        amenities: safeJsonParse(property.amenities),
-        facilities: safeJsonParse(property.facilities),
-        roommates: safeJsonParse(property.roommates),
-        rules: safeJsonParse(property.rules),
-        price_range: safeJsonParse(property.price_range),
-        bills_inclusive: safeJsonParse(property.bills_inclusive)
-      };
-      return res.json(processedProperty);
-    }
-
-    const approvedQuery = `
+/**
+ * GET /api/admin/dashboard
+ * Get admin dashboard statistics
+ */
+router.get('/dashboard', auth, requireAdmin, async (req, res) => {
+  try {
+    // Get overall statistics
+    const statsQuery = `
       SELECT 
-        ap.*,
+        (SELECT COUNT(*) FROM users) as total_users,
+        (SELECT COUNT(*) FROM users WHERE role = 'user') as total_regular_users,
+        (SELECT COUNT(*) FROM users WHERE role = 'propertyowner') as total_property_owners,
+        (SELECT COUNT(*) FROM all_properties) as total_properties,
+        (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'pending') as pending_properties,
+        (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'approved') as approved_properties,
+        (SELECT COUNT(*) FROM all_properties WHERE is_active = 1) as active_properties,
+        (SELECT COUNT(*) FROM user_interactions WHERE interaction_type = 'complaint' AND complaint_status = 'pending') as pending_complaints,
+        (SELECT COUNT(*) FROM booking_requests WHERE status = 'pending') as pending_bookings
+    `;
+
+    const stats = await query(statsQuery);
+    const dashboardStats = stats[0];
+
+    // Get recent activities
+    const recentPropsQuery = `
+      SELECT ap.id, ap.property_type, ap.unit_type, ap.address, ap.created_at, ap.approval_status,
+             u.username as owner_username
+      FROM all_properties ap
+      INNER JOIN users u ON ap.user_id = u.id
+      WHERE ap.approval_status = 'pending'
+      ORDER BY ap.created_at DESC
+      LIMIT 5
+    `;
+
+    const recentComplaints = `
+      SELECT ui.id, ui.complaint_category, ui.complaint_description, ui.created_at,
+             ap.property_type, ap.address, u.username as complainant
+      FROM user_interactions ui
+      INNER JOIN all_properties ap ON ui.property_id = ap.id
+      INNER JOIN users u ON ui.user_id = u.id
+      WHERE ui.interaction_type = 'complaint' AND ui.complaint_status = 'pending'
+      ORDER BY ui.created_at DESC
+      LIMIT 5
+    `;
+
+    const recentUsers = `
+      SELECT id, username, email, role, created_at, email_verified
+      FROM users
+      ORDER BY created_at DESC
+      LIMIT 5
+    `;
+
+    const [pendingProperties, complaints, newUsers] = await Promise.all([
+      query(recentPropsQuery),
+      query(recentComplaints),
+      query(recentUsers)
+    ]);
+
+    res.json({
+      statistics: dashboardStats,
+      recent_activities: {
+        pending_properties: pendingProperties,
+        pending_complaints: complaints,
+        new_users: newUsers
+      },
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error fetching admin dashboard:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch dashboard data. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/admin/users
+ * Get all users with filtering and pagination
+ */
+router.get('/users', auth, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const offset = (page - 1) * limit;
+    const role = req.query.role;
+    const search = req.query.search;
+    const sort = req.query.sort || 'created_at';
+    const order = req.query.order === 'asc' ? 'ASC' : 'DESC';
+
+    let whereClause = '';
+    let queryParams = [];
+
+    // Build where clause
+    const conditions = [];
+    
+    if (role && ['user', 'propertyowner', 'admin'].includes(role)) {
+      conditions.push('u.role = ?');
+      queryParams.push(role);
+    }
+
+    if (search) {
+      conditions.push('(u.username LIKE ? OR u.email LIKE ?)');
+      queryParams.push(`%${search}%`, `%${search}%`);
+    }
+
+    if (conditions.length > 0) {
+      whereClause = 'WHERE ' + conditions.join(' AND ');
+    }
+
+    // Validate sort field
+    const allowedSortFields = ['username', 'email', 'role', 'created_at', 'email_verified'];
+    const sortField = allowedSortFields.includes(sort) ? sort : 'created_at';
+
+    // Count total users
+    const countQuery = `SELECT COUNT(*) as total FROM users u ${whereClause}`;
+    const countResult = await query(countQuery, queryParams);
+    const totalUsers = countResult[0].total;
+
+    // Get users with profile info
+    const usersQuery = `
+      SELECT 
+        u.id, u.username, u.email, u.role, u.email_verified, u.created_at, u.updated_at,
+        up.first_name, up.last_name, up.phone, up.business_name,
+        (SELECT COUNT(*) FROM all_properties WHERE user_id = u.id) as property_count,
+        (SELECT COUNT(*) FROM booking_requests WHERE user_id = u.id) as booking_count
+      FROM users u
+      LEFT JOIN user_profiles up ON u.id = up.user_id
+      ${whereClause}
+      ORDER BY u.${sortField} ${order}
+      LIMIT ? OFFSET ?
+    `;
+
+    queryParams.push(limit, offset);
+    const users = await query(usersQuery, queryParams);
+
+    res.json({
+      users: users.map(user => ({
+        ...user,
+        email_verified: Boolean(user.email_verified),
+        property_count: parseInt(user.property_count) || 0,
+        booking_count: parseInt(user.booking_count) || 0
+      })),
+      pagination: {
+        page: page,
+        limit: limit,
+        total: totalUsers,
+        totalPages: Math.ceil(totalUsers / limit),
+        hasNext: page < Math.ceil(totalUsers / limit),
+        hasPrevious: page > 1
+      },
+      filters: {
+        role: role || null,
+        search: search || null,
+        sort: sortField,
+        order: order.toLowerCase()
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch users. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/admin/properties/pending
+ * Get properties pending approval
+ */
+router.get('/properties/pending', auth, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const offset = (page - 1) * limit;
+
+    const countQuery = `
+      SELECT COUNT(*) as total 
+      FROM all_properties 
+      WHERE approval_status = 'pending'
+    `;
+    const countResult = await query(countQuery);
+    const totalPending = countResult[0].total;
+
+    const propertiesQuery = `
+      SELECT 
+        ap.*, 
         u.username as owner_username,
         u.email as owner_email,
-        u.phone as owner_phone,
-        'approved' as source_table
+        up.business_name as owner_business_name,
+        up.phone as owner_phone
       FROM all_properties ap
-      LEFT JOIN users u ON ap.user_id = u.id
-      WHERE ap.id = ?
+      INNER JOIN users u ON ap.user_id = u.id
+      LEFT JOIN user_profiles up ON u.id = up.user_id
+      WHERE ap.approval_status = 'pending'
+      ORDER BY ap.created_at ASC
+      LIMIT ? OFFSET ?
     `;
 
-    db.query(approvedQuery, [propertyId], (err, approvedResults) => {
-      if (err) {
-        console.error('Error fetching property from all_properties:', err);
-        return res.status(500).json({ 
-          error: 'Error fetching property details',
-          details: err.message 
-        });
-      }
+    const properties = await query(propertiesQuery, [limit, offset]);
 
-      if (approvedResults.length > 0) {
-        const property = approvedResults[0];
-        const processedProperty = {
-          ...property,
-          amenities: safeJsonParse(property.amenities),
-          facilities: safeJsonParse(property.facilities),
-          roommates: safeJsonParse(property.roommates),
-          rules: safeJsonParse(property.rules),
-          price_range: safeJsonParse(property.price_range),
-          bills_inclusive: safeJsonParse(property.bills_inclusive)
-        };
-        return res.json(processedProperty);
+    const processedProperties = properties.map(property => ({
+      ...property,
+      price: parseFloat(property.price),
+      amenities: safeJsonParse(property.amenities),
+      facilities: safeJsonParse(property.facilities),
+      images: safeJsonParse(property.images),
+      owner_info: {
+        username: property.owner_username,
+        email: property.owner_email,
+        business_name: property.owner_business_name,
+        phone: property.owner_phone
       }
+    }));
 
-      return res.status(404).json({ 
+    // Clean up processed properties
+    processedProperties.forEach(property => {
+      delete property.owner_username;
+      delete property.owner_email;
+      delete property.owner_business_name;
+      delete property.owner_phone;
+    });
+
+    res.json({
+      pending_properties: processedProperties,
+      pagination: {
+        page: page,
+        limit: limit,
+        total: totalPending,
+        totalPages: Math.ceil(totalPending / limit),
+        hasNext: page < Math.ceil(totalPending / limit),
+        hasPrevious: page > 1
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching pending properties:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch pending properties. Please try again.'
+    });
+  }
+});
+
+/**
+ * PUT /api/admin/properties/:id/approve
+ * Approve a property
+ */
+router.put('/properties/:id/approve', auth, requireAdmin, async (req, res) => {
+  const propertyId = req.params.id;
+  const adminId = req.user.id;
+  const { approval_reason } = req.body;
+
+  if (!propertyId || isNaN(propertyId)) {
+    return res.status(400).json({
+      error: 'Invalid property ID',
+      message: 'Property ID must be a valid number'
+    });
+  }
+
+  try {
+    // Check if property exists and is pending
+    const existingProperty = await query(
+      'SELECT id, user_id, property_type, address, approval_status FROM all_properties WHERE id = ?',
+      [propertyId]
+    );
+
+    if (existingProperty.length === 0) {
+      return res.status(404).json({
         error: 'Property not found',
-        redirectTo: '/admin/new-listings'
+        message: 'The specified property does not exist'
       });
+    }
+
+    const property = existingProperty[0];
+
+    if (property.approval_status !== 'pending') {
+      return res.status(400).json({
+        error: 'Invalid status',
+        message: `Property is already ${property.approval_status}`
+      });
+    }
+
+    // Update property status using property_details table if it exists, otherwise all_properties
+    const queries = [
+      {
+        sql: 'UPDATE all_properties SET approval_status = ?, is_active = 1, updated_at = NOW() WHERE id = ?',
+        params: ['approved', propertyId]
+      }
+    ];
+
+    // Check if property_details entry exists and update it too
+    const propertyDetailsExists = await query(
+      'SELECT id FROM property_details WHERE user_id = ?',
+      [property.user_id]
+    );
+
+    if (propertyDetailsExists.length > 0) {
+      queries.push({
+        sql: 'UPDATE property_details SET approval_status = ?, approval_reason = ?, approved_by = ?, approved_at = NOW(), updated_at = NOW() WHERE user_id = ?',
+        params: ['approved', approval_reason || 'Property meets all requirements', adminId, property.user_id]
+      });
+    }
+
+    await executeTransaction(queries);
+
+    res.json({
+      message: 'Property approved successfully',
+      property_id: parseInt(propertyId),
+      property_info: {
+        type: property.property_type,
+        address: property.address
+      },
+      approved_by: req.user.username,
+      approved_at: new Date().toISOString()
     });
-  });
+
+  } catch (error) {
+    console.error('Error approving property:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to approve property. Please try again.'
+    });
+  }
 });
 
-router.post('/approve-property/:id', auth, requireAdminRole, (req, res) => {
+/**
+ * PUT /api/admin/properties/:id/reject
+ * Reject a property
+ */
+router.put('/properties/:id/reject', auth, requireAdmin, async (req, res) => {
   const propertyId = req.params.id;
   const adminId = req.user.id;
-  const { price, notes } = req.body;
+  const { rejection_reason } = req.body;
 
-  if (!price || isNaN(price) || price <= 0) {
-    return res.status(400).json({ 
-      error: 'Valid price is required for property approval',
-      redirectTo: '/admin/new-listings'
+  if (!propertyId || isNaN(propertyId)) {
+    return res.status(400).json({
+      error: 'Invalid property ID',
+      message: 'Property ID must be a valid number'
     });
   }
 
-  db.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error getting database connection:', err);
-      return res.status(500).json({ error: 'Database connection error' });
-    }
-
-    connection.beginTransaction((err) => {
-      if (err) {
-        connection.release();
-        console.error('Error starting transaction:', err);
-        return res.status(500).json({ error: 'Transaction error' });
-      }
-
-      const checkQuery = `
-        SELECT * FROM property_details 
-        WHERE id = ? AND approval_status = 'pending' AND is_deleted = 0
-      `;
-
-      connection.query(checkQuery, [propertyId], (err, results) => {
-        if (err) {
-          return connection.rollback(() => {
-            connection.release();
-            console.error('Error checking property status:', err);
-            res.status(500).json({ error: 'Error verifying property' });
-          });
-        }
-
-        if (results.length === 0) {
-          return connection.rollback(() => {
-            connection.release();
-            res.status(404).json({ 
-              error: 'Property not found or not in pending status',
-              redirectTo: '/admin/new-listings'
-            });
-          });
-        }
-
-        const property = results[0];
-
-        const updateStatusQuery = `
-          UPDATE property_details 
-          SET approval_status = 'approved', 
-              admin_notes = ?,
-              approved_by = ?,
-              approved_at = NOW(),
-              updated_at = NOW()
-          WHERE id = ?
-        `;
-
-        connection.query(updateStatusQuery, [notes || null, adminId, propertyId], (err) => {
-          if (err) {
-            return connection.rollback(() => {
-              connection.release();
-              console.error('Error updating property status:', err);
-              res.status(500).json({ error: 'Error approving property' });
-            });
-          }
-
-          const insertApprovedQuery = `
-            INSERT INTO all_properties (
-              id, user_id, property_type, unit_type, amenities, facilities, 
-              other_facility, roommates, rules, contract_policy, address, 
-              available_from, available_to, price_range, bills_inclusive, 
-              price, is_active, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())
-            ON DUPLICATE KEY UPDATE
-              property_type = VALUES(property_type),
-              unit_type = VALUES(unit_type),
-              amenities = VALUES(amenities),
-              facilities = VALUES(facilities),
-              other_facility = VALUES(other_facility),
-              roommates = VALUES(roommates),
-              rules = VALUES(rules),
-              contract_policy = VALUES(contract_policy),
-              address = VALUES(address),
-              available_from = VALUES(available_from),
-              available_to = VALUES(available_to),
-              price_range = VALUES(price_range),
-              bills_inclusive = VALUES(bills_inclusive),
-              price = VALUES(price),
-              is_active = 1,
-              updated_at = NOW()
-          `;
-
-          const approvedValues = [
-            propertyId,
-            property.user_id,
-            property.property_type,
-            property.unit_type,
-            property.amenities,
-            property.facilities,
-            property.other_facility,
-            property.roommates,
-            property.rules,
-            property.contract_policy,
-            property.address,
-            property.available_from,
-            property.available_to,
-            property.price_range,
-            property.bills_inclusive,
-            parseFloat(price)
-          ];
-
-          connection.query(insertApprovedQuery, approvedValues, (err) => {
-            if (err) {
-              return connection.rollback(() => {
-                connection.release();
-                console.error('Error inserting into all_properties:', err);
-                res.status(500).json({ error: 'Error publishing approved property' });
-              });
-            }
-
-            connection.commit((err) => {
-              if (err) {
-                return connection.rollback(() => {
-                  connection.release();
-                  console.error('Error committing approval transaction:', err);
-                  res.status(500).json({ error: 'Error finalizing approval' });
-                });
-              }
-
-              connection.release();
-              res.json({
-                message: 'Property approved successfully',
-                propertyId: propertyId,
-                price: parseFloat(price),
-                status: 'approved',
-                approvedBy: adminId,
-                approvedAt: new Date().toISOString(),
-                redirectTo: '/admin/new-listings'
-              });
-            });
-          });
-        });
-      });
-    });
-  });
-});
-
-router.post('/reject-property/:id', auth, requireAdminRole, (req, res) => {
-  const propertyId = req.params.id;
-  const adminId = req.user.id;
-  const { reason } = req.body;
-
-  if (!reason || reason.trim().length < 10) {
-    return res.status(400).json({ 
-      error: 'Rejection reason is required and must be at least 10 characters long',
-      redirectTo: '/admin/new-listings'
+  if (!rejection_reason || rejection_reason.trim().length < 10) {
+    return res.status(400).json({
+      error: 'Rejection reason required',
+      message: 'Please provide a detailed rejection reason (at least 10 characters)'
     });
   }
 
-  const rejectQuery = `
-    UPDATE property_details 
-    SET approval_status = 'rejected', 
-        rejection_reason = ?,
-        rejected_by = ?,
-        rejected_at = NOW(),
-        updated_at = NOW()
-    WHERE id = ? AND approval_status = 'pending' AND is_deleted = 0
-  `;
+  try {
+    const existingProperty = await query(
+      'SELECT id, user_id, property_type, address, approval_status FROM all_properties WHERE id = ?',
+      [propertyId]
+    );
 
-  db.query(rejectQuery, [reason, adminId, propertyId], (err, results) => {
-    if (err) {
-      console.error('Error rejecting property:', err);
-      return res.status(500).json({ error: 'Error rejecting property' });
-    }
-
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ 
-        error: 'Property not found or not in pending status',
-        redirectTo: '/admin/new-listings'
+    if (existingProperty.length === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'The specified property does not exist'
       });
     }
 
-    res.json({
-      message: 'Property rejected successfully',
-      propertyId: propertyId,
-      reason: reason,
-      status: 'rejected',
-      rejectedBy: adminId,
-      rejectedAt: new Date().toISOString(),
-      redirectTo: '/admin/new-listings'
-    });
-  });
-});
+    const property = existingProperty[0];
 
-router.get('/stats', auth, requireAdminRole, (req, res) => {
-  const statsQuery = `
-    SELECT 
-      (SELECT COUNT(*) FROM users WHERE role = 'user') as total_users,
-      (SELECT COUNT(*) FROM users WHERE role = 'propertyowner') as total_property_owners,
-      (SELECT COUNT(*) FROM property_details WHERE approval_status = 'pending' AND is_deleted = 0) as pending_properties,
-      (SELECT COUNT(*) FROM all_properties WHERE is_active = 1) as approved_properties,
-      (SELECT COUNT(*) FROM property_details WHERE approval_status = 'rejected' AND is_deleted = 0) as rejected_properties,
-      (SELECT COUNT(*) FROM booking_requests) as total_bookings,
-      (SELECT COUNT(*) FROM booking_requests WHERE status = 'confirmed') as confirmed_bookings,
-      (SELECT COUNT(*) FROM booking_requests WHERE status = 'pending') as pending_bookings,
-      (SELECT COUNT(*) FROM users WHERE DATE(created_at) = CURDATE()) as new_users_today,
-      (SELECT COUNT(*) FROM property_details WHERE DATE(created_at) = CURDATE() AND is_deleted = 0) as new_properties_today,
-      (SELECT COALESCE(SUM(views_count), 0) FROM all_properties) as total_property_views
-  `;
-
-  db.query(statsQuery, (err, results) => {
-    if (err) {
-      console.error('Error fetching admin stats:', err);
-      return res.status(500).json({ error: 'Error fetching statistics' });
-    }
-
-    const stats = results[0];
-    
-    res.json({
-      users: {
-        total: stats.total_users,
-        propertyOwners: stats.total_property_owners,
-        newToday: stats.new_users_today
-      },
-      properties: {
-        pending: stats.pending_properties,
-        approved: stats.approved_properties,
-        rejected: stats.rejected_properties,
-        newToday: stats.new_properties_today
-      },
-      bookings: {
-        total: stats.total_bookings,
-        confirmed: stats.confirmed_bookings,
-        pending: stats.pending_bookings
-      },
-      engagement: {
-        totalPropertyViews: stats.total_property_views
-      }
-    });
-  });
-});
-
-router.get('/users', auth, requireAdminRole, (req, res) => {
-  const { role, page = 1, limit = 20, search = '' } = req.query;
-  const offset = (parseInt(page) - 1) * parseInt(limit);
-
-  let whereClause = 'WHERE 1=1';
-  let queryParams = [];
-
-  if (role && ['user', 'propertyowner'].includes(role)) {
-    whereClause += ' AND u.role = ?';
-    queryParams.push(role);
-  }
-
-  if (search && search.trim()) {
-    whereClause += ' AND (u.username LIKE ? OR u.email LIKE ? OR up.first_name LIKE ? OR up.last_name LIKE ?)';
-    const searchTerm = `%${search.trim()}%`;
-    queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
-  }
-
-  const query = `
-    SELECT 
-      u.id,
-      u.username,
-      u.email,
-      u.role,
-      u.created_at,
-      u.last_login,
-      up.first_name,
-      up.last_name,
-      up.business_name,
-      up.phone,
-      up.account_status,
-      (SELECT COUNT(*) FROM property_details WHERE user_id = u.id AND is_deleted = 0) as property_count,
-      (SELECT COUNT(*) FROM booking_requests WHERE user_id = u.id) as booking_count,
-      COUNT(*) OVER() as total_count
-    FROM users u
-    LEFT JOIN user_profiles up ON u.id = up.user_id
-    ${whereClause}
-    ORDER BY u.created_at DESC
-    LIMIT ? OFFSET ?
-  `;
-
-  queryParams.push(parseInt(limit), offset);
-
-  db.query(query, queryParams, (err, results) => {
-    if (err) {
-      console.error('Error fetching users list:', err);
-      return res.status(500).json({ error: 'Error fetching users' });
-    }
-
-    const totalCount = results.length > 0 ? results[0].total_count : 0;
-    const totalPages = Math.ceil(totalCount / parseInt(limit));
-
-    res.json({
-      users: results,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages: totalPages,
-        totalUsers: totalCount,
-        hasNextPage: parseInt(page) < totalPages,
-        hasPrevPage: parseInt(page) > 1
-      }
-    });
-  });
-});
-
-router.put('/user/:id/status', auth, requireAdminRole, (req, res) => {
-  const userId = req.params.id;
-  const { status } = req.body;
-  const adminId = req.user.id;
-
-  if (!['active', 'inactive', 'suspended'].includes(status)) {
-    return res.status(400).json({ 
-      error: 'Status must be "active", "inactive", or "suspended"'
-    });
-  }
-
-  if (userId == adminId) {
-    return res.status(400).json({ 
-      error: 'Cannot change your own account status'
-    });
-  }
-
-  const checkUserQuery = 'SELECT role FROM users WHERE id = ?';
-  
-  db.query(checkUserQuery, [userId], (err, results) => {
-    if (err) {
-      console.error('Error checking user:', err);
-      return res.status(500).json({ error: 'Error verifying user' });
-    }
-
-    if (results.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    if (results[0].role === 'admin') {
-      return res.status(403).json({ 
-        error: 'Cannot modify admin account status'
+    if (property.approval_status !== 'pending') {
+      return res.status(400).json({
+        error: 'Invalid status',
+        message: `Property is already ${property.approval_status}`
       });
     }
 
-    const updateQuery = `
-      INSERT INTO user_profiles (user_id, account_status, updated_at) 
-      VALUES (?, ?, NOW())
-      ON DUPLICATE KEY UPDATE 
-      account_status = VALUES(account_status), 
-      updated_at = NOW()
+    const queries = [
+      {
+        sql: 'UPDATE all_properties SET approval_status = ?, is_active = 0, updated_at = NOW() WHERE id = ?',
+        params: ['rejected', propertyId]
+      }
+    ];
+
+    // Update property_details if exists
+    const propertyDetailsExists = await query(
+      'SELECT id FROM property_details WHERE user_id = ?',
+      [property.user_id]
+    );
+
+    if (propertyDetailsExists.length > 0) {
+      queries.push({
+        sql: 'UPDATE property_details SET approval_status = ?, rejected_reason = ?, approved_by = ?, updated_at = NOW() WHERE user_id = ?',
+        params: ['rejected', rejection_reason, adminId, property.user_id]
+      });
+    }
+
+    await executeTransaction(queries);
+
+    res.json({
+      message: 'Property rejected',
+      property_id: parseInt(propertyId),
+      property_info: {
+        type: property.property_type,
+        address: property.address
+      },
+      rejection_reason: rejection_reason,
+      rejected_by: req.user.username,
+      rejected_at: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error rejecting property:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to reject property. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/admin/complaints
+ * Get all complaints with filtering
+ */
+router.get('/complaints', auth, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const offset = (page - 1) * limit;
+    const status = req.query.status; // 'pending', 'reviewed', 'resolved'
+    const category = req.query.category;
+
+    let whereClause = "WHERE ui.interaction_type = 'complaint'";
+    let queryParams = [];
+
+    if (status && ['pending', 'reviewed', 'resolved'].includes(status)) {
+      whereClause += ' AND ui.complaint_status = ?';
+      queryParams.push(status);
+    }
+
+    if (category) {
+      whereClause += ' AND ui.complaint_category = ?';
+      queryParams.push(category);
+    }
+
+    const countQuery = `
+      SELECT COUNT(*) as total 
+      FROM user_interactions ui 
+      ${whereClause}
+    `;
+    const countResult = await query(countQuery, queryParams);
+    const totalComplaints = countResult[0].total;
+
+    const complaintsQuery = `
+      SELECT 
+        ui.id as complaint_id, ui.complaint_category, ui.complaint_description, 
+        ui.complaint_status, ui.created_at as submitted_at, ui.updated_at as status_updated,
+        ui.property_id, ap.property_type, ap.unit_type, ap.address,
+        complainant.username as complainant_username,
+        complainant.email as complainant_email,
+        owner.username as property_owner_username,
+        owner.email as property_owner_email
+      FROM user_interactions ui
+      INNER JOIN all_properties ap ON ui.property_id = ap.id
+      INNER JOIN users complainant ON ui.user_id = complainant.id
+      INNER JOIN users owner ON ap.user_id = owner.id
+      ${whereClause}
+      ORDER BY ui.created_at DESC
+      LIMIT ? OFFSET ?
     `;
 
-    db.query(updateQuery, [userId, status], (err) => {
-      if (err) {
-        console.error('Error updating user status:', err);
-        return res.status(500).json({ error: 'Error updating user status' });
-      }
-
-      res.json({
-        message: `User account ${status === 'active' ? 'activated' : status === 'inactive' ? 'deactivated' : 'suspended'} successfully`,
-        userId: userId,
-        status: status,
-        updatedBy: adminId,
-        updatedAt: new Date().toISOString()
-      });
-    });
-  });
-});
-
-router.put('/remove-property/:id', auth, requireAdminRole, (req, res) => {
-  const propertyId = req.params.id;
-  const { reason } = req.body;
-  const adminId = req.user.id;
-
-  if (!reason || reason.trim().length < 5) {
-    return res.status(400).json({ 
-      error: 'Removal reason is required and must be at least 5 characters long'
-    });
-  }
-
-  db.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error getting database connection:', err);
-      return res.status(500).json({ error: 'Database connection error' });
-    }
-
-    connection.beginTransaction((err) => {
-      if (err) {
-        connection.release();
-        console.error('Error starting transaction:', err);
-        return res.status(500).json({ error: 'Transaction error' });
-      }
-
-      const deactivateQuery = `
-        UPDATE all_properties 
-        SET is_active = 0, 
-            removal_reason = ?,
-            removed_by = ?,
-            removed_at = NOW(),
-            updated_at = NOW()
-        WHERE id = ?
-      `;
-
-      connection.query(deactivateQuery, [reason.trim(), adminId, propertyId], (err, result) => {
-        if (err) {
-          return connection.rollback(() => {
-            connection.release();
-            console.error('Error deactivating property:', err);
-            res.status(500).json({ error: 'Error removing property from public view' });
-          });
-        }
-
-        if (result.affectedRows === 0) {
-          return connection.rollback(() => {
-            connection.release();
-            res.status(404).json({ 
-              error: 'Property not found in approved listings',
-              redirectTo: '/admin/all-properties'
-            });
-          });
-        }
-
-        const markDeletedQuery = `
-          UPDATE property_details 
-          SET is_deleted = 1,
-              deletion_reason = ?,
-              deleted_by = ?,
-              deleted_at = NOW(),
-              updated_at = NOW()
-          WHERE id = ?
-        `;
-
-        connection.query(markDeletedQuery, [reason.trim(), adminId, propertyId], (err) => {
-          if (err) {
-            return connection.rollback(() => {
-              connection.release();
-              console.error('Error marking property as deleted:', err);
-              res.status(500).json({ error: 'Error updating property status' });
-            });
-          }
-
-          connection.commit((err) => {
-            if (err) {
-              return connection.rollback(() => {
-                connection.release();
-                console.error('Error committing removal transaction:', err);
-                res.status(500).json({ error: 'Error finalizing property removal' });
-              });
-            }
-
-            connection.release();
-            res.json({
-              message: 'Property removed successfully',
-              propertyId: propertyId,
-              reason: reason.trim(),
-              removedBy: adminId,
-              removedAt: new Date().toISOString(),
-              redirectTo: '/admin/all-properties'
-            });
-          });
-        });
-      });
-    });
-  });
-});
-
-router.get('/activity-log', auth, requireAdminRole, (req, res) => {
-  const { page = 1, limit = 50, userId, action, startDate, endDate } = req.query;
-  const offset = (parseInt(page) - 1) * parseInt(limit);
-
-  let whereClause = 'WHERE 1=1';
-  let queryParams = [];
-
-  if (userId) {
-    whereClause += ' AND user_id = ?';
-    queryParams.push(userId);
-  }
-
-  if (action) {
-    whereClause += ' AND action = ?';
-    queryParams.push(action);
-  }
-
-  if (startDate) {
-    whereClause += ' AND created_at >= ?';
-    queryParams.push(startDate);
-  }
-
-  if (endDate) {
-    whereClause += ' AND created_at <= ?';
-    queryParams.push(endDate);
-  }
-
-  const query = `
-    SELECT 
-      al.*,
-      u.username,
-      u.role,
-      COUNT(*) OVER() as total_count
-    FROM activity_logs al
-    LEFT JOIN users u ON al.user_id = u.id
-    ${whereClause}
-    ORDER BY al.created_at DESC
-    LIMIT ? OFFSET ?
-  `;
-
-  queryParams.push(parseInt(limit), offset);
-
-  db.query(query, queryParams, (err, results) => {
-    if (err) {
-      console.error('Error fetching activity log:', err);
-      return res.status(500).json({ error: 'Error fetching activity log' });
-    }
-
-    const totalCount = results.length > 0 ? results[0].total_count : 0;
-    const totalPages = Math.ceil(totalCount / parseInt(limit));
+    queryParams.push(limit, offset);
+    const complaints = await query(complaintsQuery, queryParams);
 
     res.json({
-      activities: results,
+      complaints: complaints,
       pagination: {
-        currentPage: parseInt(page),
-        totalPages,
-        totalCount,
-        hasNext: parseInt(page) < totalPages,
-        hasPrev: parseInt(page) > 1
+        page: page,
+        limit: limit,
+        total: totalComplaints,
+        totalPages: Math.ceil(totalComplaints / limit),
+        hasNext: page < Math.ceil(totalComplaints / limit),
+        hasPrevious: page > 1
+      },
+      filters: {
+        status: status || null,
+        category: category || null
       }
     });
-  });
+
+  } catch (error) {
+    console.error('Error fetching complaints:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch complaints. Please try again.'
+    });
+  }
+});
+
+/**
+ * PUT /api/admin/complaints/:id/status
+ * Update complaint status
+ */
+router.put('/complaints/:id/status', auth, requireAdmin, async (req, res) => {
+  const complaintId = req.params.id;
+  const { status, admin_notes } = req.body;
+
+  if (!complaintId || isNaN(complaintId)) {
+    return res.status(400).json({
+      error: 'Invalid complaint ID',
+      message: 'Complaint ID must be a valid number'
+    });
+  }
+
+  const allowedStatuses = ['pending', 'reviewed', 'resolved'];
+  if (!status || !allowedStatuses.includes(status)) {
+    return res.status(400).json({
+      error: 'Invalid status',
+      message: `Status must be one of: ${allowedStatuses.join(', ')}`
+    });
+  }
+
+  try {
+    const existingComplaint = await query(
+      'SELECT id, complaint_status, property_id FROM user_interactions WHERE id = ? AND interaction_type = ?',
+      [complaintId, 'complaint']
+    );
+
+    if (existingComplaint.length === 0) {
+      return res.status(404).json({
+        error: 'Complaint not found',
+        message: 'The specified complaint does not exist'
+      });
+    }
+
+    const complaint = existingComplaint[0];
+
+    await query(
+      'UPDATE user_interactions SET complaint_status = ?, updated_at = NOW() WHERE id = ?',
+      [status, complaintId]
+    );
+
+    res.json({
+      message: 'Complaint status updated successfully',
+      complaint_id: parseInt(complaintId),
+      old_status: complaint.complaint_status,
+      new_status: status,
+      admin_notes: admin_notes || null,
+      updated_by: req.user.username,
+      updated_at: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error updating complaint status:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to update complaint status. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/admin/bookings
+ * Get all booking requests with filtering
+ */
+router.get('/bookings', auth, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const offset = (page - 1) * limit;
+    const status = req.query.status;
+
+    let whereClause = '';
+    let queryParams = [];
+
+    if (status && ['pending', 'approved', 'rejected', 'cancelled'].includes(status)) {
+      whereClause = 'WHERE br.status = ?';
+      queryParams.push(status);
+    }
+
+    const countQuery = `SELECT COUNT(*) as total FROM booking_requests br ${whereClause}`;
+    const countResult = await query(countQuery, queryParams);
+    const totalBookings = countResult[0].total;
+
+    const bookingsQuery = `
+      SELECT 
+        br.*, 
+        ap.property_type, ap.unit_type, ap.address as property_address,
+        tenant.username as tenant_username, tenant.email as tenant_email,
+        owner.username as owner_username, owner.email as owner_email
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      INNER JOIN users tenant ON br.user_id = tenant.id
+      INNER JOIN users owner ON br.property_owner_id = owner.id
+      ${whereClause}
+      ORDER BY br.created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    queryParams.push(limit, offset);
+    const bookings = await query(bookingsQuery, queryParams);
+
+    res.json({
+      bookings: bookings,
+      pagination: {
+        page: page,
+        limit: limit,
+        total: totalBookings,
+        totalPages: Math.ceil(totalBookings / limit),
+        hasNext: page < Math.ceil(totalBookings / limit),
+        hasPrevious: page > 1
+      },
+      filters: {
+        status: status || null
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching bookings:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch bookings. Please try again.'
+    });
+  }
+});
+
+/**
+ * PUT /api/admin/users/:id/status
+ * Update user account status (activate/deactivate)
+ */
+router.put('/users/:id/status', auth, requireAdmin, async (req, res) => {
+  const userId = req.params.id;
+  const { action, reason } = req.body; // action: 'activate' or 'deactivate'
+
+  if (!userId || isNaN(userId)) {
+    return res.status(400).json({
+      error: 'Invalid user ID',
+      message: 'User ID must be a valid number'
+    });
+  }
+
+  if (!action || !['activate', 'deactivate'].includes(action)) {
+    return res.status(400).json({
+      error: 'Invalid action',
+      message: 'Action must be either "activate" or "deactivate"'
+    });
+  }
+
+  if (parseInt(userId) === req.user.id) {
+    return res.status(400).json({
+      error: 'Cannot modify own account',
+      message: 'You cannot modify your own account status'
+    });
+  }
+
+  try {
+    const existingUser = await query(
+      'SELECT id, username, email, role FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (existingUser.length === 0) {
+      return res.status(404).json({
+        error: 'User not found',
+        message: 'The specified user does not exist'
+      });
+    }
+
+    const user = existingUser[0];
+
+    if (user.role === 'admin' && action === 'deactivate') {
+      return res.status(400).json({
+        error: 'Cannot deactivate admin',
+        message: 'Admin accounts cannot be deactivated'
+      });
+    }
+
+    const newStatus = action === 'activate' ? 1 : 0;
+    
+    await query(
+      'UPDATE users SET email_verified = ?, updated_at = NOW() WHERE id = ?',
+      [newStatus, userId]
+    );
+
+    res.json({
+      message: `User ${action}d successfully`,
+      user_id: parseInt(userId),
+      user_info: {
+        username: user.username,
+        email: user.email,
+        role: user.role
+      },
+      action: action,
+      reason: reason || null,
+      updated_by: req.user.username,
+      updated_at: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error updating user status:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to update user status. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/admin/analytics
+ * Get analytics data for admin dashboard
+ */
+router.get('/analytics', auth, requireAdmin, async (req, res) => {
+  try {
+    const period = req.query.period || '30'; // days
+    const days = parseInt(period);
+
+    if (isNaN(days) || days < 1 || days > 365) {
+      return res.status(400).json({
+        error: 'Invalid period',
+        message: 'Period must be between 1 and 365 days'
+      });
+    }
+
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+    const startDateStr = startDate.toISOString().split('T')[0];
+
+    // User registrations over time
+    const userRegistrations = await query(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as registrations,
+        COUNT(CASE WHEN role = 'user' THEN 1 END) as user_registrations,
+        COUNT(CASE WHEN role = 'propertyowner' THEN 1 END) as owner_registrations
+      FROM users 
+      WHERE created_at >= ?
+      GROUP BY DATE(created_at)
+      ORDER BY date
+    `, [startDateStr]);
+
+    // Property submissions over time
+    const propertySubmissions = await query(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as submissions,
+        COUNT(CASE WHEN approval_status = 'approved' THEN 1 END) as approved,
+        COUNT(CASE WHEN approval_status = 'rejected' THEN 1 END) as rejected
+      FROM all_properties 
+      WHERE created_at >= ?
+      GROUP BY DATE(created_at)
+      ORDER BY date
+    `, [startDateStr]);
+
+    // Top property types
+    const topPropertyTypes = await query(`
+      SELECT 
+        property_type,
+        COUNT(*) as count,
+        COUNT(CASE WHEN approval_status = 'approved' THEN 1 END) as approved_count
+      FROM all_properties 
+      WHERE created_at >= ?
+      GROUP BY property_type
+      ORDER BY count DESC
+      LIMIT 10
+    `, [startDateStr]);
+
+    // Complaint categories
+    const complaintCategories = await query(`
+      SELECT 
+        complaint_category,
+        COUNT(*) as count,
+        COUNT(CASE WHEN complaint_status = 'resolved' THEN 1 END) as resolved_count
+      FROM user_interactions 
+      WHERE interaction_type = 'complaint' AND created_at >= ?
+      GROUP BY complaint_category
+      ORDER BY count DESC
+    `, [startDateStr]);
+
+    res.json({
+      period_days: days,
+      start_date: startDateStr,
+      analytics: {
+        user_registrations: userRegistrations,
+        property_submissions: propertySubmissions,
+        top_property_types: topPropertyTypes,
+        complaint_categories: complaintCategories
+      },
+      generated_at: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error fetching analytics:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch analytics data. Please try again.'
+    });
+  }
 });
 
 module.exports = router;

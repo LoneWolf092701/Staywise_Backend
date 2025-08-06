@@ -1,557 +1,560 @@
 const express = require('express');
 const router = express.Router();
-const bcrypt = require('bcryptjs');
-const auth = require('../middleware/auth');
-const db = require('../config/db');
-const { upload, uploadToCloudinary } = require('../middleware/upload');
-
-// Helper function to validate profile data based on user role
-function validateProfileData(profileData, userRole) {
-  const { username, email } = profileData;
-  
-  if (!username || username.trim().length < 3) {
-    return { 
-      isValid: false, 
-      message: 'Username must be at least 3 characters long',
-      field: 'username' 
-    };
-  }
-  
-  if (!email || !email.includes('@')) {
-    return { 
-      isValid: false, 
-      message: 'Valid email address is required',
-      field: 'email' 
-    };
-  }
-
-  // Role-specific validation
-  if (userRole === 'user') {
-    const { firstName, lastName } = profileData;
-    if (!firstName || firstName.trim().length < 1) {
-      return { 
-        isValid: false, 
-        message: 'First name is required for users',
-        field: 'firstName' 
-      };
-    }
-    if (!lastName || lastName.trim().length < 1) {
-      return { 
-        isValid: false, 
-        message: 'Last name is required for users',
-        field: 'lastName' 
-      };
-    }
-  } else if (userRole === 'propertyowner') {
-    const { businessName, contactPerson } = profileData;
-    if (!businessName || businessName.trim().length < 1) {
-      return { 
-        isValid: false, 
-        message: 'Business name is required for property owners',
-        field: 'businessName' 
-      };
-    }
-    if (!contactPerson || contactPerson.trim().length < 1) {
-      return { 
-        isValid: false, 
-        message: 'Contact person is required for property owners',
-        field: 'contactPerson' 
-      };
-    }
-  }
-
-  return { isValid: true };
-}
-
-// Helper function to build profile fields based on user role
-function buildProfileFields(profileData, userRole) {
-  const baseFields = {
-    phone: profileData.phone || null,
-    profile_image: profileData.profileImage || null
-  };
-
-  if (userRole === 'user') {
-    return {
-      ...baseFields,
-      first_name: profileData.firstName || null,
-      last_name: profileData.lastName || null,
-      gender: profileData.gender || null,
-      birthdate: profileData.birthdate || null,
-      nationality: profileData.nationality || null
-    };
-  } else if (userRole === 'propertyowner') {
-    return {
-      ...baseFields,
-      business_name: profileData.businessName || null,
-      contact_person: profileData.contactPerson || null,
-      business_type: profileData.businessType || null,
-      business_registration: profileData.businessRegistration || null,
-      business_address: profileData.businessAddress || null
-    };
-  } else if (userRole === 'admin') {
-    return {
-      ...baseFields,
-      first_name: profileData.firstName || null,
-      last_name: profileData.lastName || null,
-      department: profileData.department || null,
-      admin_level: profileData.adminLevel || null
-    };
-  }
-
-  return baseFields;
-}
+const { query, executeTransaction } = require('../config/db');
+const { auth } = require('../middleware/auth');
+const { uploadProfileImage, processFileUpload, handleUploadError } = require('../middleware/upload');
 
 /**
  * GET /api/profile
- * Retrieve the current user's profile information
- * This route adapts the response based on the user's role
+ * Get user profile information including user data and profile details
  */
-router.get('/', auth, (req, res) => {
+router.get('/', auth, async (req, res) => {
   const userId = req.user.id;
-  const userRole = req.user.role;
 
-  // Base query to get common user information
-  let query = `
-    SELECT 
-      u.id,
-      u.username,
-      u.email,
-      u.role,
-      u.created_at,
-      u.updated_at,
-      up.*
-    FROM users u
-    LEFT JOIN user_profiles up ON u.id = up.user_id
-    WHERE u.id = ?
-  `;
+  try {
+    const userQuery = `
+      SELECT id, username, email, role, email_verified, created_at, updated_at 
+      FROM users 
+      WHERE id = ?
+    `;
+    const users = await query(userQuery, [userId]);
 
-  db.query(query, [userId], (err, results) => {
-    if (err) {
-      console.error('Error fetching user profile:', err);
-      return res.status(500).json({ 
-        error: 'Error fetching profile data',
-        details: err.message 
+    if (users.length === 0) {
+      return res.status(404).json({
+        error: 'User not found',
+        message: 'User account not found'
       });
     }
 
-    if (results.length === 0) {
-      return res.status(404).json({ 
-        error: 'User profile not found' 
-      });
-    }
+    const user = users[0];
 
-    const user = results[0];
-    
-    // Structure the response based on user role and available data
-    const profileData = {
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      role: user.role,
-      phone: user.phone || '',
-      profileImage: user.profile_image || '',
-      emailVerified: user.email_verified || false,
-      createdAt: user.created_at,
-      updatedAt: user.updated_at
+    const profileQuery = `
+      SELECT 
+        phone, profile_image, first_name, last_name, gender, birthdate, nationality,
+        business_name, contact_person, business_type, business_registration, business_address,
+        department, admin_level, created_at as profile_created, updated_at as profile_updated
+      FROM user_profiles 
+      WHERE user_id = ?
+    `;
+    const profiles = await query(profileQuery, [userId]);
+
+    const profile = profiles.length > 0 ? profiles[0] : null;
+
+    const responseData = {
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        email_verified: Boolean(user.email_verified),
+        created_at: user.created_at,
+        updated_at: user.updated_at
+      },
+      profile: profile ? {
+        phone: profile.phone,
+        profile_image: profile.profile_image,
+        first_name: profile.first_name,
+        last_name: profile.last_name,
+        gender: profile.gender,
+        birthdate: profile.birthdate,
+        nationality: profile.nationality,
+        business_name: profile.business_name,
+        contact_person: profile.contact_person,
+        business_type: profile.business_type,
+        business_registration: profile.business_registration,
+        business_address: profile.business_address,
+        department: profile.department,
+        admin_level: profile.admin_level,
+        profile_created: profile.profile_created,
+        profile_updated: profile.profile_updated
+      } : null
     };
 
-    // Add role-specific fields based on user type
-    if (userRole === 'user') {
-      profileData.firstName = user.first_name || '';
-      profileData.lastName = user.last_name || '';
-      profileData.gender = user.gender || '';
-      profileData.birthdate = user.birthdate || '';
-      profileData.nationality = user.nationality || '';
-    } else if (userRole === 'propertyowner') {
-      profileData.businessName = user.business_name || '';
-      profileData.contactPerson = user.contact_person || '';
-      profileData.businessType = user.business_type || '';
-      profileData.businessRegistration = user.business_registration || '';
-      profileData.businessAddress = user.business_address || '';
-    } else if (userRole === 'admin') {
-      profileData.firstName = user.first_name || '';
-      profileData.lastName = user.last_name || '';
-      profileData.department = user.department || '';
-      profileData.adminLevel = user.admin_level || '';
-    }
+    res.json(responseData);
 
-    res.json(profileData);
-  });
+  } catch (error) {
+    console.error('Error fetching profile:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to retrieve profile information. Please try again.'
+    });
+  }
 });
 
 /**
  * PUT /api/profile
- * Update the current user's profile information
- * This route handles different fields based on user role
+ * Update user profile information
+ * Handles different profile fields based on user role
  */
-router.put('/', auth, (req, res) => {
+router.put('/', auth, async (req, res) => {
   const userId = req.user.id;
   const userRole = req.user.role;
   const profileData = req.body;
 
-  // Validate required fields based on user role
-  const validation = validateProfileData(profileData, userRole);
-  if (!validation.isValid) {
-    return res.status(400).json({ 
-      error: 'Validation failed',
-      message: validation.message,
-      field: validation.field
+  if (!profileData || Object.keys(profileData).length === 0) {
+    return res.status(400).json({
+      error: 'Missing profile data',
+      message: 'Profile data is required for update'
     });
   }
 
-  // Start transaction to update both users and user_profiles tables
-  db.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error getting database connection:', err);
-      return res.status(500).json({ error: 'Database connection error' });
+  try {
+    const userExists = await query(
+      'SELECT id, username, email, role FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (userExists.length === 0) {
+      return res.status(404).json({
+        error: 'User not found',
+        message: 'User account not found'
+      });
     }
 
-    connection.beginTransaction((err) => {
-      if (err) {
-        connection.release();
-        console.error('Error starting transaction:', err);
-        return res.status(500).json({ error: 'Transaction error' });
-      }
+    const queries = [];
 
-      // Update users table with common fields
-      const updateUserQuery = `
-        UPDATE users 
-        SET username = ?, email = ?, updated_at = NOW()
-        WHERE id = ?
-      `;
+    if (profileData.username || profileData.email) {
+      const userUpdateFields = {};
+      const userUpdateParams = [];
 
-      connection.query(updateUserQuery, [profileData.username, profileData.email, userId], (err) => {
-        if (err) {
-          return connection.rollback(() => {
-            connection.release();
-            console.error('Error updating users table:', err);
-            
-            // Check for duplicate username/email
-            if (err.code === 'ER_DUP_ENTRY') {
-              return res.status(409).json({ 
-                error: 'Username or email already exists',
-                message: 'Please choose a different username or email address'
-              });
-            }
-            
-            res.status(500).json({ 
-              error: 'Error updating profile',
-              details: err.message 
-            });
+      if (profileData.username && profileData.username !== userExists[0].username) {
+        if (profileData.username.length < 3) {
+          return res.status(400).json({
+            error: 'Invalid username',
+            message: 'Username must be at least 3 characters long'
           });
         }
 
-        // Prepare data for user_profiles table based on role
-        const profileFields = buildProfileFields(profileData, userRole);
-        
-        // Check if profile exists, then insert or update accordingly
-        const checkProfileQuery = 'SELECT user_id FROM user_profiles WHERE user_id = ?';
-        
-        connection.query(checkProfileQuery, [userId], (err, results) => {
-          if (err) {
-            return connection.rollback(() => {
-              connection.release();
-              console.error('Error checking profile existence:', err);
-              res.status(500).json({ error: 'Database error' });
-            });
-          }
+        const existingUsername = await query(
+          'SELECT id FROM users WHERE username = ? AND id != ?',
+          [profileData.username, userId]
+        );
 
-          let profileQuery;
-          let queryParams;
-
-          if (results.length > 0) {
-            // Update existing profile
-            const updateFields = Object.keys(profileFields).map(field => `${field} = ?`).join(', ');
-            profileQuery = `UPDATE user_profiles SET ${updateFields}, updated_at = NOW() WHERE user_id = ?`;
-            queryParams = [...Object.values(profileFields), userId];
-          } else {
-            // Insert new profile
-            const fields = Object.keys(profileFields).join(', ');
-            const placeholders = Object.keys(profileFields).map(() => '?').join(', ');
-            profileQuery = `INSERT INTO user_profiles (user_id, ${fields}, created_at, updated_at) VALUES (?, ${placeholders}, NOW(), NOW())`;
-            queryParams = [userId, ...Object.values(profileFields)];
-          }
-
-          connection.query(profileQuery, queryParams, (err) => {
-            if (err) {
-              return connection.rollback(() => {
-                connection.release();
-                console.error('Error updating user profile:', err);
-                res.status(500).json({ 
-                  error: 'Error updating profile data',
-                  details: err.message 
-                });
-              });
-            }
-
-            // Commit the transaction
-            connection.commit((err) => {
-              if (err) {
-                return connection.rollback(() => {
-                  connection.release();
-                  console.error('Error committing transaction:', err);
-                  res.status(500).json({ error: 'Error saving changes' });
-                });
-              }
-
-              connection.release();
-              res.json({ 
-                message: 'Profile updated successfully',
-                updatedAt: new Date().toISOString()
-              });
-            });
+        if (existingUsername.length > 0) {
+          return res.status(409).json({
+            error: 'Username taken',
+            message: 'This username is already taken'
           });
-        });
-      });
-    });
-  });
-});
-
-/**
- * PUT /api/profile/password
- * Change the current user's password
- */
-router.put('/password', auth, async (req, res) => {
-  const userId = req.user.id;
-  const { currentPassword, newPassword, confirmPassword } = req.body;
-
-  // Validate password data
-  if (!currentPassword || !newPassword || !confirmPassword) {
-    return res.status(400).json({ 
-      error: 'All password fields are required',
-      message: 'Please provide current password, new password, and confirmation'
-    });
-  }
-
-  if (newPassword !== confirmPassword) {
-    return res.status(400).json({ 
-      error: 'Password confirmation does not match',
-      message: 'New password and confirmation must be identical'
-    });
-  }
-
-  if (newPassword.length < 6) {
-    return res.status(422).json({ 
-      error: 'Password too short',
-      message: 'New password must be at least 6 characters long'
-    });
-  }
-
-  try {
-    // Get current user data to verify current password
-    const getUserQuery = 'SELECT password FROM users WHERE id = ?';
-    
-    db.query(getUserQuery, [userId], async (err, results) => {
-      if (err) {
-        console.error('Error fetching user for password change:', err);
-        return res.status(500).json({ error: 'Database error' });
-      }
-
-      if (results.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      const user = results[0];
-      
-      // Verify current password
-      const isCurrentPasswordValid = await bcrypt.compare(currentPassword, user.password);
-      if (!isCurrentPasswordValid) {
-        return res.status(401).json({ 
-          error: 'Current password is incorrect',
-          message: 'Please enter your current password correctly'
-        });
-      }
-
-      // Hash new password
-      const saltRounds = 10;
-      const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
-
-      // Update password
-      const updatePasswordQuery = `
-        UPDATE users 
-        SET password = ?, updated_at = NOW()
-        WHERE id = ?
-      `;
-
-      db.query(updatePasswordQuery, [hashedNewPassword, userId], (err) => {
-        if (err) {
-          console.error('Error updating password:', err);
-          return res.status(500).json({ error: 'Error updating password' });
         }
 
-        res.json({ 
-          message: 'Password changed successfully',
-          updatedAt: new Date().toISOString()
-        });
-      });
-    });
-  } catch (error) {
-    console.error('Error in password change process:', error);
-    res.status(500).json({ error: 'Error processing password change' });
-  }
-});
-
-/**
- * POST /api/profile/image
- * Upload a profile picture for the current user
- */
-router.post('/image', auth, upload.single('profileImage'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No image file uploaded' });
-  }
-
-  try {
-    const userId = req.user.id;
-    
-    // Upload to cloudinary
-    const result = await uploadToCloudinary(req.file.buffer, req.file.originalname);
-    
-    // Update user profile with new image URL
-    const updateQuery = `
-      INSERT INTO user_profiles (user_id, profile_image, created_at, updated_at) 
-      VALUES (?, ?, NOW(), NOW())
-      ON DUPLICATE KEY UPDATE 
-      profile_image = VALUES(profile_image), 
-      updated_at = NOW()
-    `;
-
-    db.query(updateQuery, [userId, result.secure_url], (err) => {
-      if (err) {
-        console.error('Error updating profile image:', err);
-        return res.status(500).json({ error: 'Error saving profile image' });
+        userUpdateFields.username = '?';
+        userUpdateParams.push(profileData.username);
       }
 
-      res.json({
-        message: 'Profile image uploaded successfully',
-        imageUrl: result.secure_url
-      });
-    });
-
-  } catch (error) {
-    console.error('Error uploading profile image:', error);
-    res.status(500).json({ error: 'Error uploading image' });
-  }
-});
-
-/**
- * DELETE /api/profile
- * Delete the current user's account (with password confirmation)
- */
-router.delete('/', auth, async (req, res) => {
-  const userId = req.user.id;
-  const userRole = req.user.role;
-  const { password } = req.body;
-
-  if (!password) {
-    return res.status(400).json({ 
-      error: 'Password confirmation is required',
-      message: 'Please provide your current password to delete your account'
-    });
-  }
-
-  // Prevent admin account deletion via this route
-  if (userRole === 'admin') {
-    return res.status(403).json({ 
-      error: 'Admin accounts cannot be deleted via this route',
-      message: 'Please contact system administrator for account management'
-    });
-  }
-
-  try {
-    // Verify password
-    const getUserQuery = 'SELECT password FROM users WHERE id = ?';
-    
-    db.query(getUserQuery, [userId], async (err, results) => {
-      if (err) {
-        console.error('Error fetching user for deletion:', err);
-        return res.status(500).json({ error: 'Database error' });
-      }
-
-      if (results.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      const user = results[0];
-      
-      // Verify password
-      const isPasswordValid = await bcrypt.compare(password, user.password);
-      if (!isPasswordValid) {
-        return res.status(401).json({ 
-          error: 'Password is incorrect',
-          message: 'Please enter your current password correctly'
-        });
-      }
-
-      // Delete user (CASCADE will handle related records)
-      const deleteQuery = 'DELETE FROM users WHERE id = ?';
-      
-      db.query(deleteQuery, [userId], (err) => {
-        if (err) {
-          console.error('Error deleting user account:', err);
-          return res.status(500).json({ error: 'Error deleting account' });
+      if (profileData.email && profileData.email !== userExists[0].email) {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(profileData.email)) {
+          return res.status(400).json({
+            error: 'Invalid email',
+            message: 'Please provide a valid email address'
+          });
         }
 
-        res.json({ 
-          message: 'Account deleted successfully',
-          deletedAt: new Date().toISOString()
+        const existingEmail = await query(
+          'SELECT id FROM users WHERE email = ? AND id != ?',
+          [profileData.email, userId]
+        );
+
+        if (existingEmail.length > 0) {
+          return res.status(409).json({
+            error: 'Email taken',
+            message: 'This email is already registered'
+          });
+        }
+
+        userUpdateFields.email = '?';
+        userUpdateFields.email_verified = '0';
+        userUpdateParams.push(profileData.email);
+      }
+
+      if (Object.keys(userUpdateFields).length > 0) {
+        const userUpdateSql = `
+          UPDATE users 
+          SET ${Object.keys(userUpdateFields).map(key => `${key} = ?`).join(', ')}, updated_at = NOW() 
+          WHERE id = ?
+        `;
+        userUpdateParams.push(userId);
+        queries.push({
+          sql: userUpdateSql,
+          params: userUpdateParams
         });
-      });
+      }
+    }
+
+    const profileFields = buildProfileFields(profileData, userRole);
+    if (Object.keys(profileFields).length > 0) {
+      const existingProfile = await query(
+        'SELECT user_id FROM user_profiles WHERE user_id = ?',
+        [userId]
+      );
+
+      const profileKeys = Object.keys(profileFields);
+      const profileValues = Object.values(profileFields);
+
+      if (existingProfile.length > 0) {
+        const profileUpdateSql = `
+          UPDATE user_profiles 
+          SET ${profileKeys.map(key => `${key} = ?`).join(', ')}, updated_at = NOW() 
+          WHERE user_id = ?
+        `;
+        profileValues.push(userId);
+        queries.push({
+          sql: profileUpdateSql,
+          params: profileValues
+        });
+      } else {
+        const profileInsertSql = `
+          INSERT INTO user_profiles (user_id, ${profileKeys.join(', ')}, created_at, updated_at) 
+          VALUES (?, ${profileKeys.map(() => '?').join(', ')}, NOW(), NOW())
+        `;
+        queries.push({
+          sql: profileInsertSql,
+          params: [userId, ...profileValues]
+        });
+      }
+    }
+
+    if (queries.length > 0) {
+      await executeTransaction(queries);
+    }
+
+    const updatedUser = await query(
+      'SELECT id, username, email, role, email_verified, updated_at FROM users WHERE id = ?',
+      [userId]
+    );
+
+    const updatedProfile = await query(
+      `SELECT 
+        phone, profile_image, first_name, last_name, gender, birthdate, nationality,
+        business_name, contact_person, business_type, business_registration, business_address,
+        department, admin_level, updated_at as profile_updated
+      FROM user_profiles WHERE user_id = ?`,
+      [userId]
+    );
+
+    res.json({
+      message: 'Profile updated successfully',
+      user: updatedUser[0],
+      profile: updatedProfile.length > 0 ? updatedProfile[0] : null
     });
+
   } catch (error) {
-    console.error('Error in account deletion process:', error);
-    res.status(500).json({ error: 'Error processing account deletion' });
+    console.error('Error updating profile:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to update profile. Please try again.'
+    });
+  }
+});
+
+/**
+ * POST /api/profile/avatar
+ * Upload and update user profile image
+ */
+router.post('/avatar', auth, uploadProfileImage, processFileUpload, async (req, res) => {
+  const userId = req.user.id;
+
+  if (!req.uploadedFile) {
+    return res.status(400).json({
+      error: 'No file uploaded',
+      message: 'Profile image file is required'
+    });
+  }
+
+  try {
+    const existingProfile = await query(
+      'SELECT user_id, profile_image FROM user_profiles WHERE user_id = ?',
+      [userId]
+    );
+
+    const profileImageUrl = req.uploadedFile.url;
+
+    if (existingProfile.length > 0) {
+      await query(
+        'UPDATE user_profiles SET profile_image = ?, updated_at = NOW() WHERE user_id = ?',
+        [profileImageUrl, userId]
+      );
+    } else {
+      await query(
+        'INSERT INTO user_profiles (user_id, profile_image, created_at, updated_at) VALUES (?, ?, NOW(), NOW())',
+        [userId, profileImageUrl]
+      );
+    }
+
+    res.json({
+      message: 'Profile image updated successfully',
+      profile_image: profileImageUrl,
+      upload_info: {
+        filename: req.uploadedFile.filename,
+        size: req.uploadedFile.size,
+        url: req.uploadedFile.url
+      }
+    });
+
+  } catch (error) {
+    console.error('Error updating profile image:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to update profile image. Please try again.'
+    });
+  }
+});
+
+/**
+ * DELETE /api/profile/avatar
+ * Remove user profile image
+ */
+router.delete('/avatar', auth, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const existingProfile = await query(
+      'SELECT user_id, profile_image FROM user_profiles WHERE user_id = ?',
+      [userId]
+    );
+
+    if (existingProfile.length === 0 || !existingProfile[0].profile_image) {
+      return res.status(404).json({
+        error: 'No profile image found',
+        message: 'No profile image to remove'
+      });
+    }
+
+    await query(
+      'UPDATE user_profiles SET profile_image = NULL, updated_at = NOW() WHERE user_id = ?',
+      [userId]
+    );
+
+    res.json({
+      message: 'Profile image removed successfully'
+    });
+
+  } catch (error) {
+    console.error('Error removing profile image:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to remove profile image. Please try again.'
+    });
   }
 });
 
 /**
  * GET /api/profile/stats
- * Get profile statistics for property owners
+ * Get user activity statistics (for users to see their own activity)
  */
-router.get('/stats', auth, (req, res) => {
+router.get('/stats', auth, async (req, res) => {
   const userId = req.user.id;
   const userRole = req.user.role;
 
-  if (userRole !== 'propertyowner') {
-    return res.status(403).json({ 
-      error: 'Access denied',
-      message: 'Statistics are only available for property owners'
-    });
-  }
+  try {
+    const stats = {
+      user_id: userId,
+      role: userRole,
+      profile_completion: 0,
+      activity_summary: {}
+    };
 
-  // Get various statistics for property owner
-  const statsQuery = `
-    SELECT 
-      (SELECT COUNT(*) FROM property_details WHERE user_id = ? AND is_deleted = 0) as total_properties,
-      (SELECT COUNT(*) FROM property_details WHERE user_id = ? AND approval_status = 'approved' AND is_deleted = 0) as approved_properties,
-      (SELECT COUNT(*) FROM property_details WHERE user_id = ? AND approval_status = 'pending' AND is_deleted = 0) as pending_properties,
-      (SELECT COUNT(*) FROM booking_requests WHERE property_owner_id = ?) as total_bookings,
-      (SELECT COUNT(*) FROM booking_requests WHERE property_owner_id = ? AND status = 'confirmed') as confirmed_bookings,
-      (SELECT COALESCE(SUM(views_count), 0) FROM all_properties WHERE user_id = ?) as total_views
-  `;
+    const profileCompletion = await calculateProfileCompletion(userId, userRole);
+    stats.profile_completion = profileCompletion;
 
-  db.query(statsQuery, [userId, userId, userId, userId, userId, userId], (err, results) => {
-    if (err) {
-      console.error('Error fetching profile stats:', err);
-      return res.status(500).json({ error: 'Error fetching statistics' });
+    if (userRole === 'user') {
+      const userActivity = await query(`
+        SELECT 
+          interaction_type,
+          COUNT(*) as count,
+          MAX(created_at) as last_activity
+        FROM user_interactions 
+        WHERE user_id = ?
+        GROUP BY interaction_type
+      `, [userId]);
+
+      userActivity.forEach(activity => {
+        stats.activity_summary[activity.interaction_type] = {
+          total: activity.count,
+          last_activity: activity.last_activity
+        };
+      });
+
+    } else if (userRole === 'propertyowner') {
+      const propertyStats = await query(`
+        SELECT 
+          COUNT(*) as total_properties,
+          COUNT(CASE WHEN approval_status = 'approved' THEN 1 END) as approved_properties,
+          COUNT(CASE WHEN approval_status = 'pending' THEN 1 END) as pending_properties,
+          SUM(views_count) as total_views
+        FROM all_properties 
+        WHERE user_id = ?
+      `, [userId]);
+
+      if (propertyStats.length > 0) {
+        stats.activity_summary.properties = propertyStats[0];
+      }
+
+      const bookingStats = await query(`
+        SELECT 
+          COUNT(*) as total_bookings,
+          COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_bookings,
+          COUNT(CASE WHEN status = 'approved' THEN 1 END) as approved_bookings
+        FROM booking_requests 
+        WHERE property_owner_id = ?
+      `, [userId]);
+
+      if (bookingStats.length > 0) {
+        stats.activity_summary.bookings = bookingStats[0];
+      }
+
+    } else if (userRole === 'admin') {
+      const adminStats = await query(`
+        SELECT 
+          COUNT(CASE WHEN approval_status = 'pending' THEN 1 END) as pending_properties,
+          COUNT(CASE WHEN ui.complaint_status = 'pending' THEN 1 END) as pending_complaints
+        FROM all_properties ap
+        LEFT JOIN user_interactions ui ON ap.id = ui.property_id AND ui.interaction_type = 'complaint'
+      `);
+
+      if (adminStats.length > 0) {
+        stats.activity_summary.admin_tasks = adminStats[0];
+      }
     }
 
-    const stats = results[0];
-    
-    res.json({
-      properties: {
-        total: stats.total_properties,
-        approved: stats.approved_properties,
-        pending: stats.pending_properties
-      },
-      bookings: {
-        total: stats.total_bookings,
-        confirmed: stats.confirmed_bookings
-      },
-      engagement: {
-        totalViews: stats.total_views
-      }
+    res.json(stats);
+
+  } catch (error) {
+    console.error('Error fetching profile stats:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch profile statistics. Please try again.'
     });
-  });
+  }
 });
+
+/**
+ * Helper function to build profile fields based on user role and provided data
+ */
+function buildProfileFields(profileData, userRole) {
+  const fields = {};
+
+  // Common fields for all users
+  if (profileData.phone !== undefined) {
+    fields.phone = profileData.phone;
+  }
+  if (profileData.first_name !== undefined) {
+    fields.first_name = profileData.first_name;
+  }
+  if (profileData.last_name !== undefined) {
+    fields.last_name = profileData.last_name;
+  }
+  if (profileData.gender !== undefined) {
+    const allowedGenders = ['male', 'female', 'other'];
+    if (allowedGenders.includes(profileData.gender)) {
+      fields.gender = profileData.gender;
+    }
+  }
+  if (profileData.birthdate !== undefined) {
+    fields.birthdate = profileData.birthdate;
+  }
+  if (profileData.nationality !== undefined) {
+    fields.nationality = profileData.nationality;
+  }
+
+  // Business fields for property owners
+  if (userRole === 'propertyowner') {
+    if (profileData.business_name !== undefined) {
+      fields.business_name = profileData.business_name;
+    }
+    if (profileData.contact_person !== undefined) {
+      fields.contact_person = profileData.contact_person;
+    }
+    if (profileData.business_type !== undefined) {
+      fields.business_type = profileData.business_type;
+    }
+    if (profileData.business_registration !== undefined) {
+      fields.business_registration = profileData.business_registration;
+    }
+    if (profileData.business_address !== undefined) {
+      fields.business_address = profileData.business_address;
+    }
+  }
+
+  // Admin fields for administrators
+  if (userRole === 'admin') {
+    if (profileData.department !== undefined) {
+      fields.department = profileData.department;
+    }
+    if (profileData.admin_level !== undefined) {
+      const allowedLevels = ['junior', 'senior', 'manager', 'director'];
+      if (allowedLevels.includes(profileData.admin_level)) {
+        fields.admin_level = profileData.admin_level;
+      }
+    }
+  }
+
+  return fields;
+}
+
+/**
+ * Helper function to calculate profile completion percentage
+ */
+async function calculateProfileCompletion(userId, userRole) {
+  try {
+    const user = await query(
+      'SELECT username, email, email_verified FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (user.length === 0) return 0;
+
+    const profile = await query(
+      `SELECT 
+        phone, profile_image, first_name, last_name, gender, birthdate, nationality,
+        business_name, contact_person, business_type, business_registration, business_address,
+        department, admin_level
+      FROM user_profiles WHERE user_id = ?`,
+      [userId]
+    );
+
+    let completedFields = 0;
+    let totalFields = 0;
+
+    // Basic user fields (always counted)
+    totalFields += 5; // username, email, email_verified, first_name, last_name
+    if (user[0].username) completedFields++;
+    if (user[0].email) completedFields++;
+    if (user[0].email_verified) completedFields++;
+
+    if (profile.length > 0) {
+      const p = profile[0];
+      if (p.first_name) completedFields++;
+      if (p.last_name) completedFields++;
+
+      // Optional common fields
+      totalFields += 4; // phone, gender, birthdate, nationality
+      if (p.phone) completedFields++;
+      if (p.gender) completedFields++;
+      if (p.birthdate) completedFields++;
+      if (p.nationality) completedFields++;
+
+      // Role-specific fields
+      if (userRole === 'propertyowner') {
+        totalFields += 3; // business_name, contact_person, business_type
+        if (p.business_name) completedFields++;
+        if (p.contact_person) completedFields++;
+        if (p.business_type) completedFields++;
+      } else if (userRole === 'admin') {
+        totalFields += 2; // department, admin_level
+        if (p.department) completedFields++;
+        if (p.admin_level) completedFields++;
+      }
+    }
+
+    return Math.round((completedFields / totalFields) * 100);
+  } catch (error) {
+    console.error('Error calculating profile completion:', error);
+    return 0;
+  }
+}
+
+// Error handling middleware for this route
+router.use(handleUploadError);
 
 module.exports = router;

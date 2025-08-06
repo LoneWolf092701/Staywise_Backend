@@ -2,576 +2,586 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const db = require('../config/db');
-const auth = require('../middleware/auth');
+const { query, getConnection } = require('../config/db');
+const { auth, requireAdmin } = require('../middleware/auth');
 
-// Helper function to validate email format
-function isValidEmail(email) {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
-}
+const generateToken = (user) => {
+  return jwt.sign(
+    { 
+      user: { 
+        id: user.id, 
+        username: user.username, 
+        email: user.email, 
+        role: user.role 
+      } 
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '24h' }
+  );
+};
 
-// Helper function to validate password strength
-function isValidPassword(password) {
-  return password && password.length >= 6;
-}
-
-/**
- * POST /api/auth/register
- * Register a new user account
- */
 router.post('/register', async (req, res) => {
-  try {
-    const { username, email, password, role } = req.body;
-    
-    // Validate input
-    if (!username || !email || !password) {
-      return res.status(400).json({ 
-        error: 'Missing required fields',
-        message: 'Username, email, and password are required'
-      });
-    }
+  const { username, email, password, role = 'user' } = req.body;
 
-    if (username.trim().length < 3) {
-      return res.status(400).json({ 
-        error: 'Invalid username',
-        message: 'Username must be at least 3 characters long'
-      });
-    }
-
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ 
-        error: 'Invalid email',
-        message: 'Please provide a valid email address'
-      });
-    }
-
-    if (!isValidPassword(password)) {
-      return res.status(400).json({ 
-        error: 'Invalid password',
-        message: 'Password must be at least 6 characters long'
-      });
-    }
-
-    // Default role is 'user' if none is provided
-    const userRole = role && ['user', 'propertyowner'].includes(role) ? role : 'user';
-
-    // Check if username or email already exists
-    const checkExistingQuery = 'SELECT id, username, email FROM users WHERE username = ? OR email = ?';
-    
-    db.query(checkExistingQuery, [username, email], async (err, results) => {
-      if (err) {
-        console.error('Error checking existing user:', err);
-        return res.status(500).json({ 
-          error: 'Database error',
-          message: 'Error checking user existence'
-        });
-      }
-
-      if (results.length > 0) {
-        const existingUser = results[0];
-        if (existingUser.username === username) {
-          return res.status(409).json({ 
-            error: 'Username already exists',
-            message: 'Please choose a different username'
-          });
-        }
-        if (existingUser.email === email) {
-          return res.status(409).json({ 
-            error: 'Email already exists',
-            message: 'An account with this email already exists'
-          });
-        }
-      }
-
-      try {
-        // Hash password
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(password, salt);
-
-        // Insert new user
-        const insertQuery = 'INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)';
-        
-        db.query(insertQuery, [username.trim(), email.trim().toLowerCase(), hashedPassword, userRole], (err, results) => {
-          if (err) {
-            console.error('Error creating user:', err);
-            return res.status(500).json({ 
-              error: 'Database error',
-              message: 'Error creating user account'
-            });
-          }
-
-          const newUserId = results.insertId;
-          
-          res.status(201).json({ 
-            message: 'User registered successfully',
-            user: { 
-              id: newUserId, 
-              username: username.trim(), 
-              email: email.trim().toLowerCase(),
-              role: userRole 
-            }
-          });
-        });
-
-      } catch (hashError) {
-        console.error('Error hashing password:', hashError);
-        return res.status(500).json({ 
-          error: 'Server error',
-          message: 'Error processing registration'
-        });
-      }
-    });
-
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ 
-      error: 'Server error',
-      message: 'Internal server error during registration'
+  if (!username || !email || !password) {
+    return res.status(400).json({
+      error: 'Missing required fields',
+      message: 'Username, email, and password are required'
     });
   }
-});
 
-/**
- * POST /api/auth/login
- * Authenticate user and return JWT token
- */
-router.post('/login', (req, res) => {
-  try {
-    const { username, password } = req.body;
-
-    // Validate input
-    if (!username || !password) {
-      return res.status(400).json({ 
-        error: 'Missing credentials',
-        message: 'Username and password are required'
-      });
-    }
-
-    // Find user by username or email
-    const findUserQuery = 'SELECT * FROM users WHERE username = ? OR email = ?';
-    
-    db.query(findUserQuery, [username.trim(), username.trim().toLowerCase()], async (err, results) => {
-      if (err) {
-        console.error('Error finding user:', err);
-        return res.status(500).json({ 
-          error: 'Database error',
-          message: 'Error during authentication'
-        });
-      }
-
-      if (results.length === 0) {
-        return res.status(401).json({ 
-          error: 'Invalid credentials',
-          message: 'Username or password is incorrect'
-        });
-      }
-
-      const user = results[0];
-
-      try {
-        // Verify password
-        const isMatch = await bcrypt.compare(password, user.password);
-        
-        if (!isMatch) {
-          return res.status(401).json({ 
-            error: 'Invalid credentials',
-            message: 'Username or password is incorrect'
-          });
-        }
-
-        // Check if user account is active (if you have account status)
-        // Add this check if you implement account status functionality
-
-        // Create JWT payload
-        const payload = { 
-          user: { 
-            id: user.id, 
-            username: user.username,
-            email: user.email,
-            role: user.role 
-          } 
-        };
-
-        // Sign JWT token
-        const jwtSecret = process.env.JWT_SECRET;
-        if (!jwtSecret) {
-          console.error('JWT_SECRET not configured');
-          return res.status(500).json({ 
-            error: 'Server configuration error',
-            message: 'Authentication service not properly configured'
-          });
-        }
-
-        jwt.sign(payload, jwtSecret, { expiresIn: '8h' }, (err, token) => {
-          if (err) {
-            console.error('Error signing JWT:', err);
-            return res.status(500).json({ 
-              error: 'Token generation error',
-              message: 'Error generating authentication token'
-            });
-          }
-
-          // Update last login time
-          const updateLoginQuery = 'UPDATE users SET last_login = NOW() WHERE id = ?';
-          db.query(updateLoginQuery, [user.id], (updateErr) => {
-            if (updateErr) {
-              console.error('Error updating last login:', updateErr);
-              // Don't fail the login for this error
-            }
-          });
-
-          // Return token and user info
-          res.json({ 
-            message: 'Login successful',
-            token, 
-            user: { 
-              id: user.id, 
-              username: user.username,
-              email: user.email,
-              role: user.role 
-            },
-            expiresIn: '8h'
-          });
-        });
-
-      } catch (compareError) {
-        console.error('Error comparing password:', compareError);
-        return res.status(500).json({ 
-          error: 'Authentication error',
-          message: 'Error verifying credentials'
-        });
-      }
-    });
-
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ 
-      error: 'Server error',
-      message: 'Internal server error during login'
+  if (username.length < 3) {
+    return res.status(400).json({
+      error: 'Invalid username',
+      message: 'Username must be at least 3 characters long'
     });
   }
-});
 
-/**
- * POST /api/auth/forgot-password
- * Initiate password reset process
- */
-router.post('/forgot-password', (req, res) => {
-  const { email } = req.body;
+  if (password.length < 6) {
+    return res.status(400).json({
+      error: 'Invalid password',
+      message: 'Password must be at least 6 characters long'
+    });
+  }
 
-  if (!email || !isValidEmail(email)) {
-    return res.status(400).json({ 
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({
       error: 'Invalid email',
       message: 'Please provide a valid email address'
     });
   }
 
-  // Check if user exists
-  const findUserQuery = 'SELECT id, username, email FROM users WHERE email = ?';
-  
-  db.query(findUserQuery, [email.trim().toLowerCase()], (err, results) => {
-    if (err) {
-      console.error('Error finding user for password reset:', err);
-      return res.status(500).json({ 
-        error: 'Database error',
-        message: 'Error processing password reset request'
-      });
-    }
+  const allowedRoles = ['user', 'propertyowner', 'admin'];
+  if (!allowedRoles.includes(role)) {
+    return res.status(400).json({
+      error: 'Invalid role',
+      message: 'Role must be user, propertyowner, or admin'
+    });
+  }
 
-    // Always return success message for security (don't reveal if email exists)
-    const successMessage = 'If an account with this email exists, you will receive password reset instructions';
-
-    if (results.length === 0) {
-      return res.json({ message: successMessage });
-    }
-
-    const user = results[0];
-
-    // Generate reset token
-    const resetToken = jwt.sign(
-      { userId: user.id, email: user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '1h' }
+  try {
+    const existingUsers = await query(
+      'SELECT id, username, email FROM users WHERE username = ? OR email = ?',
+      [username, email]
     );
 
-    // Store reset token in database (you may want to create a password_resets table)
-    const storeTokenQuery = `
-      INSERT INTO user_profiles (user_id, password_reset_token, password_reset_expires, updated_at)
-      VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR), NOW())
-      ON DUPLICATE KEY UPDATE 
-      password_reset_token = VALUES(password_reset_token),
-      password_reset_expires = VALUES(password_reset_expires),
-      updated_at = NOW()
-    `;
+    if (existingUsers.length > 0) {
+      const existingUser = existingUsers[0];
+      const conflictField = existingUser.username === username ? 'username' : 'email';
+      return res.status(409).json({
+        error: 'User already exists',
+        message: `A user with this ${conflictField} already exists`,
+        field: conflictField
+      });
+    }
 
-    db.query(storeTokenQuery, [user.id, resetToken], (err) => {
-      if (err) {
-        console.error('Error storing reset token:', err);
-        return res.status(500).json({ 
-          error: 'Database error',
-          message: 'Error processing password reset request'
-        });
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    const result = await query(
+      'INSERT INTO users (username, email, password, role, email_verified, created_at, updated_at) VALUES (?, ?, ?, ?, 0, NOW(), NOW())',
+      [username, email, hashedPassword, role]
+    );
+
+    const newUser = {
+      id: result.insertId,
+      username,
+      email,
+      role
+    };
+
+    const token = generateToken(newUser);
+
+    res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      user: {
+        id: newUser.id,
+        username: newUser.username,
+        email: newUser.email,
+        role: newUser.role
       }
-
-      // In a real application, you would send an email here
-      // For now, we'll just return the token (remove this in production)
-      res.json({ 
-        message: successMessage,
-        // Remove this in production - only for testing
-        resetToken: resetToken
-      });
     });
-  });
-});
-
-/**
- * POST /api/auth/reset-password
- * Reset password using reset token
- */
-router.post('/reset-password', async (req, res) => {
-  try {
-    const { token, newPassword, confirmPassword } = req.body;
-
-    if (!token || !newPassword || !confirmPassword) {
-      return res.status(400).json({ 
-        error: 'Missing required fields',
-        message: 'Reset token, new password, and confirmation are required'
-      });
-    }
-
-    if (newPassword !== confirmPassword) {
-      return res.status(400).json({ 
-        error: 'Password mismatch',
-        message: 'New password and confirmation must match'
-      });
-    }
-
-    if (!isValidPassword(newPassword)) {
-      return res.status(400).json({ 
-        error: 'Invalid password',
-        message: 'Password must be at least 6 characters long'
-      });
-    }
-
-    try {
-      // Verify reset token
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      const userId = decoded.userId;
-
-      // Check if token is still valid in database
-      const checkTokenQuery = `
-        SELECT user_id FROM user_profiles 
-        WHERE user_id = ? AND password_reset_token = ? AND password_reset_expires > NOW()
-      `;
-
-      db.query(checkTokenQuery, [userId, token], async (err, results) => {
-        if (err) {
-          console.error('Error checking reset token:', err);
-          return res.status(500).json({ 
-            error: 'Database error',
-            message: 'Error verifying reset token'
-          });
-        }
-
-        if (results.length === 0) {
-          return res.status(400).json({ 
-            error: 'Invalid or expired token',
-            message: 'Reset token is invalid or has expired'
-          });
-        }
-
-        try {
-          // Hash new password
-          const salt = await bcrypt.genSalt(10);
-          const hashedPassword = await bcrypt.hash(newPassword, salt);
-
-          // Update password and clear reset token
-          const updatePasswordQuery = 'UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?';
-          
-          db.query(updatePasswordQuery, [hashedPassword, userId], (err) => {
-            if (err) {
-              console.error('Error updating password:', err);
-              return res.status(500).json({ 
-                error: 'Database error',
-                message: 'Error updating password'
-              });
-            }
-
-            // Clear reset token
-            const clearTokenQuery = `
-              UPDATE user_profiles 
-              SET password_reset_token = NULL, password_reset_expires = NULL, updated_at = NOW()
-              WHERE user_id = ?
-            `;
-
-            db.query(clearTokenQuery, [userId], (err) => {
-              if (err) {
-                console.error('Error clearing reset token:', err);
-                // Don't fail the request for this error
-              }
-
-              res.json({ 
-                message: 'Password reset successfully',
-                success: true
-              });
-            });
-          });
-
-        } catch (hashError) {
-          console.error('Error hashing new password:', hashError);
-          return res.status(500).json({ 
-            error: 'Server error',
-            message: 'Error processing password reset'
-          });
-        }
-      });
-
-    } catch (jwtError) {
-      console.error('Error verifying reset token:', jwtError);
-      return res.status(400).json({ 
-        error: 'Invalid token',
-        message: 'Reset token is invalid or has expired'
-      });
-    }
 
   } catch (error) {
-    console.error('Password reset error:', error);
-    res.status(500).json({ 
-      error: 'Server error',
-      message: 'Internal server error during password reset'
+    console.error('Registration error:', error);
+    res.status(500).json({
+      error: 'Registration failed',
+      message: 'An error occurred during registration. Please try again.'
     });
   }
 });
 
-/**
- * GET /api/auth/verify-token
- * Verify if the current token is valid
- */
-router.get('/verify-token', auth, (req, res) => {
-  // If we reach here, the token is valid (auth middleware passed)
-  res.json({ 
-    valid: true,
-    user: {
-      id: req.user.id,
-      username: req.user.username,
-      role: req.user.role
-    }
-  });
-});
+router.post('/login', async (req, res) => {
+  const { username, password } = req.body;
 
-/**
- * POST /api/auth/logout
- * Logout user (client-side token removal)
- */
-router.post('/logout', auth, (req, res) => {
-  // In a stateless JWT system, logout is handled client-side
-  // You could implement token blacklisting here if needed
-  
-  res.json({ 
-    message: 'Logged out successfully',
-    success: true
-  });
-});
+  if (!username || !password) {
+    return res.status(400).json({
+      error: 'Missing credentials',
+      message: 'Username and password are required'
+    });
+  }
 
-/**
- * POST /api/auth/change-password
- * Change password for authenticated user
- */
-router.post('/change-password', auth, async (req, res) => {
   try {
-    const userId = req.user.id;
-    const { currentPassword, newPassword, confirmPassword } = req.body;
+    const users = await query(
+      'SELECT id, username, email, password, role, email_verified FROM users WHERE username = ? OR email = ?',
+      [username, username]
+    );
 
-    if (!currentPassword || !newPassword || !confirmPassword) {
-      return res.status(400).json({ 
-        error: 'Missing required fields',
-        message: 'Current password, new password, and confirmation are required'
+    if (users.length === 0) {
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Username or password is incorrect'
       });
     }
 
-    if (newPassword !== confirmPassword) {
-      return res.status(400).json({ 
-        error: 'Password mismatch',
-        message: 'New password and confirmation must match'
+    const user = users[0];
+
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Username or password is incorrect'
       });
     }
 
-    if (!isValidPassword(newPassword)) {
-      return res.status(400).json({ 
-        error: 'Invalid password',
-        message: 'New password must be at least 6 characters long'
-      });
-    }
+    const token = generateToken(user);
 
-    // Get current password
-    const getUserQuery = 'SELECT password FROM users WHERE id = ?';
-    
-    db.query(getUserQuery, [userId], async (err, results) => {
-      if (err) {
-        console.error('Error fetching user for password change:', err);
-        return res.status(500).json({ 
-          error: 'Database error',
-          message: 'Error verifying current password'
-        });
-      }
+    await query(
+      'UPDATE users SET updated_at = NOW() WHERE id = ?',
+      [user.id]
+    );
 
-      if (results.length === 0) {
-        return res.status(404).json({ 
-          error: 'User not found',
-          message: 'User account not found'
-        });
-      }
-
-      const user = results[0];
-
-      try {
-        // Verify current password
-        const isMatch = await bcrypt.compare(currentPassword, user.password);
-        
-        if (!isMatch) {
-          return res.status(401).json({ 
-            error: 'Invalid current password',
-            message: 'Current password is incorrect'
-          });
-        }
-
-        // Hash new password
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(newPassword, salt);
-
-        // Update password
-        const updateQuery = 'UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?';
-        
-        db.query(updateQuery, [hashedPassword, userId], (err) => {
-          if (err) {
-            console.error('Error updating password:', err);
-            return res.status(500).json({ 
-              error: 'Database error',
-              message: 'Error updating password'
-            });
-          }
-
-          res.json({ 
-            message: 'Password changed successfully',
-            success: true
-          });
-        });
-
-      } catch (compareError) {
-        console.error('Error verifying current password:', compareError);
-        return res.status(500).json({ 
-          error: 'Server error',
-          message: 'Error verifying current password'
-        });
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        email_verified: user.email_verified
       }
     });
 
   } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      error: 'Login failed',
+      message: 'An error occurred during login. Please try again.'
+    });
+  }
+});
+
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({
+      error: 'Missing email',
+      message: 'Email address is required'
+    });
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({
+      error: 'Invalid email',
+      message: 'Please provide a valid email address'
+    });
+  }
+
+  try {
+    const users = await query(
+      'SELECT id, username, email FROM users WHERE email = ?',
+      [email]
+    );
+
+    if (users.length === 0) {
+      return res.json({
+        message: 'If an account with that email exists, we have sent a password reset link.',
+        info: 'For security reasons, we always show this message'
+      });
+    }
+
+    const user = users[0];
+    const resetToken = jwt.sign(
+      { userId: user.id, email: user.email, purpose: 'password-reset' },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    console.log(`Password reset requested for user ${user.username} (${user.email})`);
+    console.log(`Reset token: ${resetToken}`);
+    console.log('In production, this token would be sent via email');
+
+    res.json({
+      message: 'If an account with that email exists, we have sent a password reset link.',
+      resetToken: resetToken
+    });
+
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({
+      error: 'Request failed',
+      message: 'Unable to process password reset request. Please try again.'
+    });
+  }
+});
+
+router.post('/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body;
+
+  if (!token || !newPassword) {
+    return res.status(400).json({
+      error: 'Missing required fields',
+      message: 'Reset token and new password are required'
+    });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({
+      error: 'Invalid password',
+      message: 'Password must be at least 6 characters long'
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    if (decoded.purpose !== 'password-reset') {
+      return res.status(400).json({
+        error: 'Invalid token',
+        message: 'This token is not valid for password reset'
+      });
+    }
+
+    const users = await query(
+      'SELECT id, username, email FROM users WHERE id = ? AND email = ?',
+      [decoded.userId, decoded.email]
+    );
+
+    if (users.length === 0) {
+      return res.status(400).json({
+        error: 'Invalid token',
+        message: 'Reset token is invalid or user not found'
+      });
+    }
+
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    await query(
+      'UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?',
+      [hashedPassword, decoded.userId]
+    );
+
+    res.json({
+      message: 'Password reset successful',
+      info: 'You can now log in with your new password'
+    });
+
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(400).json({
+        error: 'Token expired',
+        message: 'Reset token has expired. Please request a new password reset.'
+      });
+    } else if (error.name === 'JsonWebTokenError') {
+      return res.status(400).json({
+        error: 'Invalid token',
+        message: 'Reset token is invalid'
+      });
+    }
+
+    console.error('Reset password error:', error);
+    res.status(500).json({
+      error: 'Reset failed',
+      message: 'Unable to reset password. Please try again.'
+    });
+  }
+});
+
+router.post('/change-password', auth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const userId = req.user.id;
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({
+      error: 'Missing required fields',
+      message: 'Current password and new password are required'
+    });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({
+      error: 'Invalid password',
+      message: 'New password must be at least 6 characters long'
+    });
+  }
+
+  if (currentPassword === newPassword) {
+    return res.status(400).json({
+      error: 'Same password',
+      message: 'New password must be different from current password'
+    });
+  }
+
+  try {
+    const users = await query(
+      'SELECT id, password FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        error: 'User not found',
+        message: 'User account not found'
+      });
+    }
+
+    const user = users[0];
+    const isValidPassword = await bcrypt.compare(currentPassword, user.password);
+
+    if (!isValidPassword) {
+      return res.status(400).json({
+        error: 'Invalid current password',
+        message: 'Current password is incorrect'
+      });
+    }
+
+    const saltRounds = 12;
+    const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    await query(
+      'UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?',
+      [hashedNewPassword, userId]
+    );
+
+    res.json({
+      message: 'Password changed successfully'
+    });
+
+  } catch (error) {
     console.error('Change password error:', error);
-    res.status(500).json({ 
-      error: 'Server error',
-      message: 'Internal server error during password change'
+    res.status(500).json({
+      error: 'Change failed',
+      message: 'Unable to change password. Please try again.'
+    });
+  }
+});
+
+router.post('/verify-email', async (req, res) => {
+  const { token } = req.body;
+
+  if (!token) {
+    return res.status(400).json({
+      error: 'Missing token',
+      message: 'Verification token is required'
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    if (decoded.purpose !== 'email-verification') {
+      return res.status(400).json({
+        error: 'Invalid token',
+        message: 'This token is not valid for email verification'
+      });
+    }
+
+    const users = await query(
+      'SELECT id, username, email, email_verified FROM users WHERE id = ? AND email = ?',
+      [decoded.userId, decoded.email]
+    );
+
+    if (users.length === 0) {
+      return res.status(400).json({
+        error: 'Invalid token',
+        message: 'Verification token is invalid or user not found'
+      });
+    }
+
+    const user = users[0];
+
+    if (user.email_verified) {
+      return res.json({
+        message: 'Email already verified',
+        info: 'Your email address is already verified'
+      });
+    }
+
+    await query(
+      'UPDATE users SET email_verified = 1, updated_at = NOW() WHERE id = ?',
+      [decoded.userId]
+    );
+
+    res.json({
+      message: 'Email verified successfully',
+      info: 'Your email address has been verified'
+    });
+
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(400).json({
+        error: 'Token expired',
+        message: 'Verification token has expired. Please request a new verification email.'
+      });
+    } else if (error.name === 'JsonWebTokenError') {
+      return res.status(400).json({
+        error: 'Invalid token',
+        message: 'Verification token is invalid'
+      });
+    }
+
+    console.error('Email verification error:', error);
+    res.status(500).json({
+      error: 'Verification failed',
+      message: 'Unable to verify email. Please try again.'
+    });
+  }
+});
+
+router.post('/resend-verification', auth, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const users = await query(
+      'SELECT id, username, email, email_verified FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        error: 'User not found',
+        message: 'User account not found'
+      });
+    }
+
+    const user = users[0];
+
+    if (user.email_verified) {
+      return res.json({
+        message: 'Email already verified',
+        info: 'Your email address is already verified'
+      });
+    }
+
+    const verificationToken = jwt.sign(
+      { userId: user.id, email: user.email, purpose: 'email-verification' },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    console.log(`Email verification requested for user ${user.username} (${user.email})`);
+    console.log(`Verification token: ${verificationToken}`);
+    console.log('In production, this token would be sent via email');
+
+    res.json({
+      message: 'Verification email sent',
+      info: 'A new verification email has been sent to your email address',
+      verificationToken: verificationToken
+    });
+
+  } catch (error) {
+    console.error('Resend verification error:', error);
+    res.status(500).json({
+      error: 'Request failed',
+      message: 'Unable to send verification email. Please try again.'
+    });
+  }
+});
+
+router.get('/me', auth, async (req, res) => {
+  try {
+    const users = await query(
+      'SELECT id, username, email, role, email_verified, created_at FROM users WHERE id = ?',
+      [req.user.id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        error: 'User not found',
+        message: 'User account not found'
+      });
+    }
+
+    const user = users[0];
+
+    res.json({
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        email_verified: user.email_verified,
+        created_at: user.created_at
+      }
+    });
+
+  } catch (error) {
+    console.error('Get user info error:', error);
+    res.status(500).json({
+      error: 'Request failed',
+      message: 'Unable to retrieve user information'
+    });
+  }
+});
+
+router.get('/users', auth, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+    const search = req.query.search || '';
+    const role = req.query.role || '';
+
+    let whereClause = '';
+    let queryParams = [];
+
+    if (search) {
+      whereClause += ' WHERE (username LIKE ? OR email LIKE ?)';
+      queryParams.push(`%${search}%`, `%${search}%`);
+    }
+
+    if (role) {
+      whereClause += search ? ' AND role = ?' : ' WHERE role = ?';
+      queryParams.push(role);
+    }
+
+    const countQuery = `SELECT COUNT(*) as total FROM users${whereClause}`;
+    const countResult = await query(countQuery, queryParams);
+    const totalUsers = countResult[0].total;
+
+    const usersQuery = `
+      SELECT id, username, email, role, email_verified, created_at, updated_at 
+      FROM users${whereClause} 
+      ORDER BY created_at DESC 
+      LIMIT ? OFFSET ?
+    `;
+    queryParams.push(limit, offset);
+
+    const users = await query(usersQuery, queryParams);
+
+    res.json({
+      users: users,
+      pagination: {
+        page: page,
+        limit: limit,
+        total: totalUsers,
+        totalPages: Math.ceil(totalUsers / limit),
+        hasNext: page < Math.ceil(totalUsers / limit),
+        hasPrevious: page > 1
+      }
+    });
+
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({
+      error: 'Request failed',
+      message: 'Unable to retrieve users list'
     });
   }
 });
