@@ -1,38 +1,84 @@
 const express = require('express');
 const router = express.Router();
-const { query, getConnection, executeTransaction } = require('../config/db');
+const { query } = require('../config/db');
 const { auth, optionalAuth } = require('../middleware/auth');
 
-/**
- * Safe JSON parsing function that handles both JSON and comma-separated string formats
- * This ensures compatibility with different data storage formats in the database
- * @param {string|null} value - The value to parse (JSON string or comma-separated string)
- * @returns {Array} Array of parsed values
- */
-const safeJsonParse = (value) => {
-  if (!value) return [];
-  
-  // If already an array, return it
-  if (Array.isArray(value)) return value;
-  
-  // If it's a string, try to parse as JSON first
-  if (typeof value === 'string') {
-    // Try JSON parsing first
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch (error) {
-      // If JSON parsing fails, treat as comma-separated string
-      return value.split(',').map(item => item.trim()).filter(item => item.length > 0);
-    }
+const safeJsonParse = (str) => {
+  try {
+    return JSON.parse(str);
+  } catch (error) {
+    return [];
   }
-  
-  return [];
 };
 
 /**
+ * POST /api/user-interactions/view
+ * Record a property view (public endpoint for analytics)
+ */
+router.post('/view', optionalAuth, async (req, res) => {
+  const { property_id, view_duration } = req.body;
+  const user_id = req.user ? req.user.id : null;
+
+  if (!property_id || isNaN(property_id)) {
+    return res.status(400).json({ 
+      error: 'Valid Property ID is required' 
+    });
+  }
+
+  try {
+    // Check if property exists and is active
+    const propertyExists = await query(
+      'SELECT id, views_count FROM all_properties WHERE id = ? AND is_active = 1',
+      [property_id]
+    );
+
+    if (propertyExists.length === 0) {
+      return res.status(404).json({ 
+        error: 'Property not found or not active' 
+      });
+    }
+
+    // Record view in user_interactions if user is logged in
+    if (user_id) {
+      try {
+        await query(
+          'INSERT INTO user_interactions (user_id, property_id, interaction_type, view_duration, created_at, updated_at) VALUES (?, ?, ?, ?, NOW(), NOW())',
+          [user_id, property_id, 'view', view_duration || null]
+        );
+      } catch (insertError) {
+        console.error('Error inserting user interaction:', insertError);
+        // Continue even if user interaction insert fails
+      }
+    }
+
+    // Increment property views count
+    try {
+      await query(
+        'UPDATE all_properties SET views_count = COALESCE(views_count, 0) + 1 WHERE id = ?',
+        [property_id]
+      );
+    } catch (updateError) {
+      console.error('Error updating views count:', updateError);
+      // Continue even if view count update fails
+    }
+
+    res.json({
+      message: 'Property view recorded successfully',
+      property_id: parseInt(property_id)
+    });
+
+  } catch (error) {
+    console.error('Error recording property view:', error);
+    res.status(500).json({ 
+      error: 'Database error',
+      message: 'Unable to record property view. Please try again.'
+    });
+  }
+});
+
+/**
  * POST /api/user-interactions/favorite
- * Add or remove a property from user favorites
+ * Toggle favorite status for a property
  */
 router.post('/favorite', auth, async (req, res) => {
   const { property_id } = req.body;
@@ -45,37 +91,26 @@ router.post('/favorite', auth, async (req, res) => {
   }
 
   try {
+    // Check if property exists and is active
     const propertyExists = await query(
-      'SELECT id, user_id, is_active, approval_status FROM all_properties WHERE id = ?',
+      'SELECT id FROM all_properties WHERE id = ? AND is_active = 1',
       [property_id]
     );
 
     if (propertyExists.length === 0) {
       return res.status(404).json({ 
-        error: 'Property not found' 
+        error: 'Property not found or not active' 
       });
     }
 
-    const property = propertyExists[0];
-
-    if (!property.is_active || property.approval_status !== 'approved') {
-      return res.status(400).json({ 
-        error: 'Property is not available for interaction' 
-      });
-    }
-
-    if (property.user_id === user_id) {
-      return res.status(400).json({ 
-        error: 'Property owners cannot favorite their own properties' 
-      });
-    }
-
+    // Check if user has already favorited this property
     const existingFavorite = await query(
       'SELECT id FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
       [user_id, property_id, 'favorite']
     );
 
     if (existingFavorite.length > 0) {
+      // Remove from favorites
       await query(
         'DELETE FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
         [user_id, property_id, 'favorite']
@@ -87,6 +122,7 @@ router.post('/favorite', auth, async (req, res) => {
         property_id: parseInt(property_id)
       });
     } else {
+      // Add to favorites
       await query(
         'INSERT INTO user_interactions (user_id, property_id, interaction_type, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())',
         [user_id, property_id, 'favorite']
@@ -109,11 +145,11 @@ router.post('/favorite', auth, async (req, res) => {
 });
 
 /**
- * POST /api/user-interactions/rating
- * Submit or update a property rating
+ * GET /api/user-interactions/favorite/:property_id
+ * Check if property is favorited by current user
  */
-router.post('/rating', auth, async (req, res) => {
-  const { property_id, rating, comment } = req.body;
+router.get('/favorite/:property_id', auth, async (req, res) => {
+  const property_id = req.params.property_id;
   const user_id = req.user.id;
 
   if (!property_id || isNaN(property_id)) {
@@ -122,13 +158,47 @@ router.post('/rating', auth, async (req, res) => {
     });
   }
 
-  if (!rating || isNaN(rating)) {
+  try {
+    const favorite = await query(
+      'SELECT id FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
+      [user_id, property_id, 'favorite']
+    );
+
+    res.json({
+      is_favorited: favorite.length > 0,
+      property_id: parseInt(property_id)
+    });
+
+  } catch (error) {
+    console.error('Error checking favorite status:', error);
+    res.status(500).json({ 
+      error: 'Database error',
+      message: 'Unable to check favorite status. Please try again.'
+    });
+  }
+});
+
+/**
+ * POST /api/user-interactions/rating
+ * Submit or update a property rating
+ */
+router.post('/rating', auth, async (req, res) => {
+  const { property_id, rating_score, rating_comment } = req.body;
+  const user_id = req.user.id;
+
+  if (!property_id || isNaN(property_id)) {
     return res.status(400).json({ 
-      error: 'Rating is required and must be a number' 
+      error: 'Valid Property ID is required' 
     });
   }
 
-  const ratingValue = parseInt(rating);
+  if (!rating_score || isNaN(rating_score)) {
+    return res.status(400).json({ 
+      error: 'Rating score is required and must be a number' 
+    });
+  }
+
+  const ratingValue = parseInt(rating_score);
   if (ratingValue < 1 || ratingValue > 5) {
     return res.status(400).json({ 
       error: 'Rating must be an integer between 1 and 5' 
@@ -136,6 +206,7 @@ router.post('/rating', auth, async (req, res) => {
   }
 
   try {
+    // Check if property exists and is available for rating
     const propertyExists = await query(
       'SELECT id, user_id, is_active, approval_status FROM all_properties WHERE id = ?',
       [property_id]
@@ -161,15 +232,17 @@ router.post('/rating', auth, async (req, res) => {
       });
     }
 
+    // Check if user has already rated this property
     const existingRating = await query(
       'SELECT id FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
       [user_id, property_id, 'rating']
     );
 
     if (existingRating.length > 0) {
+      // Update existing rating
       await query(
         'UPDATE user_interactions SET rating_score = ?, rating_comment = ?, updated_at = NOW() WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
-        [ratingValue, comment || null, user_id, property_id, 'rating']
+        [ratingValue, rating_comment || null, user_id, property_id, 'rating']
       );
 
       res.json({
@@ -179,9 +252,10 @@ router.post('/rating', auth, async (req, res) => {
         property_id: parseInt(property_id)
       });
     } else {
+      // Create new rating
       await query(
         'INSERT INTO user_interactions (user_id, property_id, interaction_type, rating_score, rating_comment, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NOW(), NOW())',
-        [user_id, property_id, 'rating', ratingValue, comment || null]
+        [user_id, property_id, 'rating', ratingValue, rating_comment || null]
       );
 
       res.json({
@@ -202,11 +276,11 @@ router.post('/rating', auth, async (req, res) => {
 });
 
 /**
- * POST /api/user-interactions/complaint
- * Submit a complaint about a property
+ * GET /api/user-interactions/rating/:property_id
+ * Get user's rating for a specific property
  */
-router.post('/complaint', auth, async (req, res) => {
-  const { property_id, category, description } = req.body;
+router.get('/rating/:property_id', auth, async (req, res) => {
+  const property_id = req.params.property_id;
   const user_id = req.user.id;
 
   if (!property_id || isNaN(property_id)) {
@@ -215,13 +289,266 @@ router.post('/complaint', auth, async (req, res) => {
     });
   }
 
-  if (!category || !description) {
+  try {
+    const userRating = await query(
+      'SELECT rating_score, rating_comment, created_at, updated_at FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
+      [user_id, property_id, 'rating']
+    );
+
+    if (userRating.length === 0) {
+      return res.json({
+        has_rated: false,
+        property_id: parseInt(property_id)
+      });
+    }
+
+    res.json({
+      has_rated: true,
+      rating: userRating[0],
+      property_id: parseInt(property_id)
+    });
+
+  } catch (error) {
+    console.error('Error fetching user rating:', error);
+    res.status(500).json({ 
+      error: 'Database error',
+      message: 'Unable to fetch rating. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/user-interactions/property-rating/:property_id
+ * Get overall rating information for a property (public endpoint)
+ */
+router.get('/property-rating/:property_id', optionalAuth, async (req, res) => {
+  const property_id = req.params.property_id;
+
+  if (!property_id || isNaN(property_id)) {
     return res.status(400).json({ 
-      error: 'Complaint category and description are required' 
+      error: 'Valid Property ID is required' 
     });
   }
 
-  if (description.length < 10) {
+  try {
+    // Get overall rating statistics
+    const overallStats = await query(
+      `SELECT 
+        COUNT(*) as total_ratings,
+        COALESCE(AVG(rating_score), 0) as average_rating
+       FROM user_interactions 
+       WHERE property_id = ? AND interaction_type = 'rating' AND rating_score IS NOT NULL`,
+      [property_id]
+    );
+
+    // Get rating distribution
+    const ratingDistribution = await query(
+      `SELECT 
+        rating_score,
+        COUNT(*) as score_count
+       FROM user_interactions 
+       WHERE property_id = ? AND interaction_type = 'rating' AND rating_score IS NOT NULL
+       GROUP BY rating_score
+       ORDER BY rating_score DESC`,
+      [property_id]
+    );
+
+    // Get recent ratings with usernames
+    const recentRatings = await query(
+      `SELECT 
+        ui.rating_score, ui.rating_comment, ui.created_at,
+        u.username as reviewer_username
+       FROM user_interactions ui
+       INNER JOIN users u ON ui.user_id = u.id
+       WHERE ui.property_id = ? AND ui.interaction_type = 'rating' AND ui.rating_score IS NOT NULL
+       ORDER BY ui.created_at DESC
+       LIMIT 5`,
+      [property_id]
+    );
+
+    const totalRatings = overallStats[0]?.total_ratings || 0;
+    const averageRating = overallStats[0]?.average_rating || 0;
+
+    const response = {
+      property_id: parseInt(property_id),
+      total_ratings: parseInt(totalRatings),
+      average_rating: parseFloat(averageRating.toFixed(2)),
+      rating_distribution: {},
+      recent_ratings: recentRatings || []
+    };
+
+    // Process rating distribution
+    if (ratingDistribution && ratingDistribution.length > 0) {
+      ratingDistribution.forEach(stat => {
+        response.rating_distribution[stat.rating_score] = stat.score_count;
+      });
+    }
+
+    // Add user's rating if authenticated
+    if (req.user) {
+      try {
+        const userRating = await query(
+          'SELECT rating_score, rating_comment FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
+          [req.user.id, property_id, 'rating']
+        );
+        
+        response.user_rating = userRating.length > 0 ? userRating[0] : null;
+        response.has_rated = userRating.length > 0;
+      } catch (userRatingError) {
+        console.error('Error fetching user rating:', userRatingError);
+        response.user_rating = null;
+        response.has_rated = false;
+      }
+    }
+
+    res.json(response);
+
+  } catch (error) {
+    console.error('Error fetching property rating:', error);
+    res.status(500).json({ 
+      error: 'Database error',
+      message: 'Unable to fetch property rating. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/user-interactions/statistics/:property_id
+ * Get property statistics - allow public access for basic stats
+ */
+router.get('/statistics/:property_id', optionalAuth, async (req, res) => {
+  const property_id = req.params.property_id;
+  const user_id = req.user ? req.user.id : null;
+  const user_role = req.user ? req.user.role : null;
+
+  if (!property_id || isNaN(property_id)) {
+    return res.status(400).json({ 
+      error: 'Valid Property ID is required' 
+    });
+  }
+
+  try {
+    // Check if property exists
+    const propertyExists = await query(
+      'SELECT id, user_id, views_count FROM all_properties WHERE id = ?',
+      [property_id]
+    );
+
+    if (propertyExists.length === 0) {
+      return res.status(404).json({ 
+        error: 'Property not found' 
+      });
+    }
+
+    const property = propertyExists[0];
+
+    // For detailed statistics, require ownership or admin role
+    const canViewDetailedStats = user_id && (user_role === 'admin' || property.user_id === user_id);
+
+    if (canViewDetailedStats) {
+      // Return detailed statistics for owners/admins
+      const statsQuery = `
+        SELECT 
+          interaction_type,
+          COUNT(*) as count,
+          AVG(CASE WHEN interaction_type = 'rating' THEN rating_score END) as avg_rating
+        FROM user_interactions 
+        WHERE property_id = ?
+        GROUP BY interaction_type
+      `;
+
+      const stats = await query(statsQuery, [property_id]);
+
+      const processedStats = {
+        property_id: parseInt(property_id),
+        total_views: property.views_count || 0,
+        total_favorites: 0,
+        total_ratings: 0,
+        total_complaints: 0,
+        total_tracked_views: 0,
+        average_rating: 0,
+        complaint_status_breakdown: {},
+        rating_distribution: {}
+      };
+
+      if (stats && stats.length > 0) {
+        stats.forEach(stat => {
+          if (stat.interaction_type === 'favorite') {
+            processedStats.total_favorites = stat.count;
+          } else if (stat.interaction_type === 'rating') {
+            processedStats.total_ratings = stat.count;
+            processedStats.average_rating = stat.avg_rating ? parseFloat(stat.avg_rating.toFixed(2)) : 0;
+          } else if (stat.interaction_type === 'complaint') {
+            processedStats.total_complaints = stat.count;
+          } else if (stat.interaction_type === 'view') {
+            processedStats.total_tracked_views = stat.count;
+          }
+        });
+      }
+
+      res.json(processedStats);
+    } else {
+      // Return basic public statistics
+      const publicStats = await query(
+        `SELECT 
+          COUNT(CASE WHEN interaction_type = 'rating' THEN 1 END) as total_ratings,
+          COALESCE(AVG(CASE WHEN interaction_type = 'rating' THEN rating_score END), 0) as average_rating,
+          COUNT(CASE WHEN interaction_type = 'favorite' THEN 1 END) as total_favorites
+         FROM user_interactions 
+         WHERE property_id = ?`,
+        [property_id]
+      );
+
+      const stats = publicStats[0] || {};
+
+      res.json({
+        property_id: parseInt(property_id),
+        total_views: property.views_count || 0,
+        total_ratings: stats.total_ratings || 0,
+        average_rating: parseFloat((stats.average_rating || 0).toFixed(2)),
+        total_favorites: stats.total_favorites || 0
+      });
+    }
+
+  } catch (error) {
+    console.error('Error fetching property statistics:', error);
+    res.status(500).json({ 
+      error: 'Database error',
+      message: 'Unable to fetch property statistics. Please try again.'
+    });
+  }
+});
+
+/**
+ * POST /api/user-interactions/complaint
+ * Submit a complaint about a property
+ */
+router.post('/complaint', auth, async (req, res) => {
+  const { property_id, category, description } = req.body;
+  const user_id = req.user.id;
+
+  console.log('Complaint request body:', req.body);
+  console.log('User ID:', user_id);
+
+  if (!property_id || isNaN(property_id)) {
+    return res.status(400).json({ 
+      error: 'Valid Property ID is required' 
+    });
+  }
+
+  if (!category) {
+    return res.status(400).json({ 
+      error: 'Complaint category is required' 
+    });
+  }
+
+  if (!description || typeof description !== 'string') {
+    return res.status(400).json({ 
+      error: 'Complaint description is required' 
+    });
+  }
+
+  if (description.trim().length < 10) {
     return res.status(400).json({ 
       error: 'Complaint description must be at least 10 characters long' 
     });
@@ -231,11 +558,13 @@ router.post('/complaint', auth, async (req, res) => {
   if (!allowedCategories.includes(category)) {
     return res.status(400).json({ 
       error: 'Invalid complaint category',
-      allowed: allowedCategories 
+      allowed: allowedCategories,
+      received: category
     });
   }
 
   try {
+    // Check if property exists
     const propertyExists = await query(
       'SELECT id, user_id FROM all_properties WHERE id = ?',
       [property_id]
@@ -249,22 +578,25 @@ router.post('/complaint', auth, async (req, res) => {
 
     const property = propertyExists[0];
 
+    // Check if user is trying to complain about their own property
     if (property.user_id === user_id) {
       return res.status(400).json({ 
-        error: 'Property owners cannot submit complaints about their own properties' 
+        error: 'You cannot submit a complaint against your own property' 
       });
     }
 
-    const result = await query(
-      'INSERT INTO user_interactions (user_id, property_id, interaction_type, complaint_category, complaint_description, complaint_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())',
-      [user_id, property_id, 'complaint', category, description, 'pending']
+    // Insert the complaint
+    await query(
+      `INSERT INTO user_interactions 
+       (user_id, property_id, interaction_type, complaint_category, complaint_description, complaint_status, created_at, updated_at) 
+       VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      [user_id, property_id, 'complaint', category, description.trim(), 'pending']
     );
 
-    res.status(201).json({
+    res.json({
       message: 'Complaint submitted successfully',
-      complaint_id: result.insertId,
-      status: 'pending',
-      property_id: parseInt(property_id)
+      property_id: parseInt(property_id),
+      status: 'pending'
     });
 
   } catch (error) {
@@ -272,63 +604,6 @@ router.post('/complaint', auth, async (req, res) => {
     res.status(500).json({ 
       error: 'Database error',
       message: 'Unable to submit complaint. Please try again.'
-    });
-  }
-});
-
-/**
- * POST /api/user-interactions/view
- * Track property view (for analytics)
- */
-router.post('/view', optionalAuth, async (req, res) => {
-  const { property_id, view_duration } = req.body;
-  const user_id = req.user ? req.user.id : null;
-
-  if (!property_id || isNaN(property_id)) {
-    return res.status(400).json({ 
-      error: 'Valid Property ID is required' 
-    });
-  }
-
-  try {
-    const propertyExists = await query(
-      'SELECT id, views_count FROM all_properties WHERE id = ? AND is_active = 1 AND approval_status = ?',
-      [property_id, 'approved']
-    );
-
-    if (propertyExists.length === 0) {
-      return res.status(404).json({ 
-        error: 'Property not found or not available' 
-      });
-    }
-
-    const queries = [
-      {
-        sql: 'UPDATE all_properties SET views_count = views_count + 1, updated_at = NOW() WHERE id = ?',
-        params: [property_id]
-      }
-    ];
-
-    if (user_id) {
-      queries.push({
-        sql: 'INSERT INTO user_interactions (user_id, property_id, interaction_type, view_duration, created_at, updated_at) VALUES (?, ?, ?, ?, NOW(), NOW())',
-        params: [user_id, property_id, 'view', view_duration || null]
-      });
-    }
-
-    await executeTransaction(queries);
-
-    res.json({
-      message: 'Property view tracked',
-      property_id: parseInt(property_id),
-      new_views_count: propertyExists[0].views_count + 1
-    });
-
-  } catch (error) {
-    console.error('Error tracking view:', error);
-    res.status(500).json({ 
-      error: 'Database error',
-      message: 'Unable to track view. Please try again.'
     });
   }
 });
@@ -396,241 +671,6 @@ router.get('/favorites', auth, async (req, res) => {
     res.status(500).json({ 
       error: 'Database error',
       message: 'Unable to fetch favorites. Please try again.'
-    });
-  }
-});
-
-/**
- * GET /api/user-interactions/ratings
- * Get user's property ratings
- */
-router.get('/ratings', auth, async (req, res) => {
-  const user_id = req.user.id;
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const offset = (page - 1) * limit;
-
-  try {
-    const countQuery = `
-      SELECT COUNT(*) as total 
-      FROM user_interactions ui 
-      INNER JOIN all_properties ap ON ui.property_id = ap.id 
-      WHERE ui.user_id = ? AND ui.interaction_type = ?
-    `;
-    const countResult = await query(countQuery, [user_id, 'rating']);
-    const totalRatings = countResult[0].total;
-
-    const ratingsQuery = `
-      SELECT 
-        ui.id as interaction_id, ui.rating_score, ui.rating_comment, 
-        ui.created_at as rated_at, ui.updated_at as rating_updated,
-        ap.id as property_id, ap.property_type, ap.unit_type, ap.address, 
-        ap.price, ap.images, ap.description,
-        u.username as owner_username
-      FROM user_interactions ui
-      INNER JOIN all_properties ap ON ui.property_id = ap.id
-      INNER JOIN users u ON ap.user_id = u.id
-      WHERE ui.user_id = ? AND ui.interaction_type = ?
-      ORDER BY ui.updated_at DESC
-      LIMIT ? OFFSET ?
-    `;
-
-    const ratings = await query(ratingsQuery, [user_id, 'rating', limit, offset]);
-
-    const processedRatings = ratings.map(rating => ({
-      ...rating,
-      images: safeJsonParse(rating.images),
-      price: parseFloat(rating.price)
-    }));
-
-    res.json({
-      ratings: processedRatings,
-      pagination: {
-        page: page,
-        limit: limit,
-        total: totalRatings,
-        totalPages: Math.ceil(totalRatings / limit),
-        hasNext: page < Math.ceil(totalRatings / limit),
-        hasPrevious: page > 1
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching ratings:', error);
-    res.status(500).json({ 
-      error: 'Database error',
-      message: 'Unable to fetch ratings. Please try again.'
-    });
-  }
-});
-
-/**
- * GET /api/user-interactions/complaints
- * Get user's submitted complaints
- */
-router.get('/complaints', auth, async (req, res) => {
-  const user_id = req.user.id;
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const offset = (page - 1) * limit;
-
-  try {
-    const countQuery = `
-      SELECT COUNT(*) as total 
-      FROM user_interactions ui 
-      WHERE ui.user_id = ? AND ui.interaction_type = ?
-    `;
-    const countResult = await query(countQuery, [user_id, 'complaint']);
-    const totalComplaints = countResult[0].total;
-
-    const complaintsQuery = `
-      SELECT 
-        ui.id as complaint_id, ui.complaint_category, ui.complaint_description, 
-        ui.complaint_status, ui.created_at as submitted_at, ui.updated_at as status_updated,
-        ap.id as property_id, ap.property_type, ap.unit_type, ap.address,
-        u.username as owner_username
-      FROM user_interactions ui
-      INNER JOIN all_properties ap ON ui.property_id = ap.id
-      INNER JOIN users u ON ap.user_id = u.id
-      WHERE ui.user_id = ? AND ui.interaction_type = ?
-      ORDER BY ui.created_at DESC
-      LIMIT ? OFFSET ?
-    `;
-
-    const complaints = await query(complaintsQuery, [user_id, 'complaint', limit, offset]);
-
-    res.json({
-      complaints: complaints,
-      pagination: {
-        page: page,
-        limit: limit,
-        total: totalComplaints,
-        totalPages: Math.ceil(totalComplaints / limit),
-        hasNext: page < Math.ceil(totalComplaints / limit),
-        hasPrevious: page > 1
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching complaints:', error);
-    res.status(500).json({ 
-      error: 'Database error',
-      message: 'Unable to fetch complaints. Please try again.'
-    });
-  }
-});
-
-/**
- * GET /api/user-interactions/property/:id/stats
- * Get interaction statistics for a specific property (for property owners and admins)
- */
-router.get('/property/:id/stats', auth, async (req, res) => {
-  const property_id = req.params.id;
-  const user_id = req.user.id;
-  const user_role = req.user.role;
-
-  if (!property_id || isNaN(property_id)) {
-    return res.status(400).json({ 
-      error: 'Valid Property ID is required' 
-    });
-  }
-
-  try {
-    const propertyExists = await query(
-      'SELECT id, user_id, views_count FROM all_properties WHERE id = ?',
-      [property_id]
-    );
-
-    if (propertyExists.length === 0) {
-      return res.status(404).json({ 
-        error: 'Property not found' 
-      });
-    }
-
-    const property = propertyExists[0];
-
-    if (user_role !== 'admin' && property.user_id !== user_id) {
-      return res.status(403).json({ 
-        error: 'Access denied',
-        message: 'You can only view statistics for your own properties' 
-      });
-    }
-
-    const statsQuery = `
-      SELECT 
-        interaction_type,
-        COUNT(*) as count,
-        AVG(CASE WHEN interaction_type = 'rating' THEN rating_score END) as avg_rating,
-        COUNT(CASE WHEN interaction_type = 'rating' THEN 1 END) as total_ratings,
-        COUNT(CASE WHEN interaction_type = 'favorite' THEN 1 END) as total_favorites,
-        COUNT(CASE WHEN interaction_type = 'complaint' THEN 1 END) as total_complaints,
-        COUNT(CASE WHEN interaction_type = 'view' THEN 1 END) as total_tracked_views
-      FROM user_interactions 
-      WHERE property_id = ?
-      GROUP BY interaction_type
-    `;
-
-    const stats = await query(statsQuery, [property_id]);
-
-    const complaintStatusQuery = `
-      SELECT complaint_status, COUNT(*) as count
-      FROM user_interactions 
-      WHERE property_id = ? AND interaction_type = 'complaint'
-      GROUP BY complaint_status
-    `;
-
-    const complaintStats = await query(complaintStatusQuery, [property_id]);
-
-    const ratingDistributionQuery = `
-      SELECT rating_score, COUNT(*) as count
-      FROM user_interactions 
-      WHERE property_id = ? AND interaction_type = 'rating'
-      GROUP BY rating_score
-      ORDER BY rating_score
-    `;
-
-    const ratingDistribution = await query(ratingDistributionQuery, [property_id]);
-
-    const processedStats = {
-      property_id: parseInt(property_id),
-      total_views: property.views_count,
-      total_favorites: 0,
-      total_ratings: 0,
-      total_complaints: 0,
-      total_tracked_views: 0,
-      average_rating: 0,
-      complaint_status_breakdown: {},
-      rating_distribution: {}
-    };
-
-    stats.forEach(stat => {
-      if (stat.interaction_type === 'favorite') {
-        processedStats.total_favorites = stat.count;
-      } else if (stat.interaction_type === 'rating') {
-        processedStats.total_ratings = stat.count;
-        processedStats.average_rating = stat.avg_rating ? parseFloat(stat.avg_rating.toFixed(2)) : 0;
-      } else if (stat.interaction_type === 'complaint') {
-        processedStats.total_complaints = stat.count;
-      } else if (stat.interaction_type === 'view') {
-        processedStats.total_tracked_views = stat.count;
-      }
-    });
-
-    complaintStats.forEach(stat => {
-      processedStats.complaint_status_breakdown[stat.complaint_status] = stat.count;
-    });
-
-    ratingDistribution.forEach(rating => {
-      processedStats.rating_distribution[rating.rating_score] = rating.count;
-    });
-
-    res.json(processedStats);
-
-  } catch (error) {
-    console.error('Error fetching property statistics:', error);
-    res.status(500).json({ 
-      error: 'Database error',
-      message: 'Unable to fetch property statistics. Please try again.'
     });
   }
 });

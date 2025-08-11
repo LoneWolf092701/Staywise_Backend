@@ -14,6 +14,7 @@ const userInteractionRoutes = require('./routes/userInteractions');
 const adminRoutes = require('./routes/admin');
 const profileRoutes = require('./routes/profile');
 const bookingRoutes = require('./routes/bookings');
+const uploadRoutes = require('./routes/upload');
 
 const app = express();
 
@@ -74,26 +75,12 @@ const limiter = rateLimit({
 
 app.use(limiter);
 
-app.use(express.json({ 
-  limit: '10mb',
-  strict: true
-}));
-app.use(express.urlencoded({ 
-  extended: true, 
-  limit: '10mb' 
-}));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 app.use((req, res, next) => {
-  const requestId = Math.random().toString(36).substring(2, 15);
-  req.requestId = requestId;
-  res.setHeader('X-Request-ID', requestId);
-  next();
-});
-
-app.use((req, res, next) => {
-  const userAgent = req.get('User-Agent') || 'Unknown';
-  const ip = req.ip || req.connection.remoteAddress || 'Unknown';
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} - IP: ${ip} - ID: ${req.requestId} - Agent: ${userAgent}`);
+  req.requestId = Math.random().toString(36).substring(2);
+  req.timestamp = new Date().toISOString();
   next();
 });
 
@@ -103,35 +90,27 @@ app.use('/api/user-interactions', userInteractionRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/profile', profileRoutes);
 app.use('/api/bookings', bookingRoutes);
+app.use('/api/upload', uploadRoutes);
 
 app.get('/health', async (req, res) => {
   try {
-    const dbHealth = await healthCheck();
-    const serverHealth = {
+    const dbStatus = await healthCheck();
+    res.json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
-      memory: process.memoryUsage(),
+      database: dbStatus,
+      memory: {
+        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
+      },
       environment: process.env.NODE_ENV || 'development'
-    };
-
-    res.json({
-      server: serverHealth,
-      database: dbHealth,
-      overall: dbHealth.status === 'healthy' ? 'healthy' : 'degraded'
     });
   } catch (error) {
-    console.error('Health check failed:', error);
     res.status(503).json({
-      server: {
-        status: 'unhealthy',
-        error: error.message,
-        timestamp: new Date().toISOString()
-      },
-      database: {
-        status: 'unknown'
-      },
-      overall: 'unhealthy'
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -140,50 +119,37 @@ app.get('/api/docs', (req, res) => {
   res.json({
     title: 'StayWise API Documentation',
     version: '1.0.0',
-    description: 'REST API for StayWise property management platform',
+    description: 'Property rental management system API',
     endpoints: {
       authentication: {
-        'POST /api/auth/register': 'Register a new user',
-        'POST /api/auth/login': 'Login user',
+        'POST /api/auth/login': 'User login',
+        'POST /api/auth/register': 'User registration',
+        'POST /api/auth/logout': 'User logout',
+        'POST /api/auth/refresh-token': 'Refresh JWT token',
         'POST /api/auth/forgot-password': 'Request password reset',
-        'POST /api/auth/reset-password': 'Reset password with token',
-        'POST /api/auth/change-password': 'Change password (authenticated)',
-        'POST /api/auth/verify-email': 'Verify email address',
-        'POST /api/auth/resend-verification': 'Resend verification email'
+        'POST /api/auth/reset-password': 'Reset password with token'
       },
       properties: {
-        'GET /api/properties': 'Get all approved properties',
-        'GET /api/properties/search': 'Search properties with filters',
-        'GET /api/properties/:id': 'Get property by ID',
-        'POST /api/properties': 'Create new property (property owner)',
-        'PUT /api/properties/:id': 'Update property (owner/admin)',
-        'DELETE /api/properties/:id': 'Delete property (owner/admin)',
+        'GET /api/properties/public': 'Get all public properties',
+        'GET /api/properties/public/:id': 'Get public property details',
+        'POST /api/properties': 'Create new property (property owners)',
+        'PUT /api/properties/:id': 'Update property',
+        'DELETE /api/properties/:id': 'Delete property',
         'GET /api/properties/owner/mine': 'Get properties owned by current user'
       },
-      userInteractions: {
-        'POST /api/user-interactions/favorite': 'Add/remove property favorite',
-        'POST /api/user-interactions/rating': 'Rate a property',
-        'POST /api/user-interactions/complaint': 'Submit property complaint',
-        'POST /api/user-interactions/view': 'Track property view',
-        'GET /api/user-interactions/favorites': 'Get user favorites',
-        'GET /api/user-interactions/ratings': 'Get user ratings'
-      },
-      admin: {
-        'GET /api/admin/users': 'Get all users (admin)',
-        'GET /api/admin/properties/pending': 'Get pending properties',
-        'PUT /api/admin/properties/:id/approve': 'Approve property',
-        'PUT /api/admin/properties/:id/reject': 'Reject property',
-        'GET /api/admin/complaints': 'Get all complaints',
-        'PUT /api/admin/complaints/:id': 'Update complaint status'
+      upload: {
+        'POST /api/upload/single': 'Upload single file',
+        'POST /api/upload/multiple': 'Upload multiple files',
+        'DELETE /api/upload/file': 'Delete uploaded file'
       },
       profile: {
         'GET /api/profile': 'Get user profile',
         'PUT /api/profile': 'Update user profile',
-        'POST /api/profile/avatar': 'Upload profile avatar'
+        'POST /api/profile/avatar': 'Upload profile image'
       },
       bookings: {
         'POST /api/bookings': 'Create booking request',
-        'GET /api/bookings': 'Get user bookings',
+        'GET /api/bookings/user': 'Get user bookings',
         'GET /api/bookings/owner': 'Get bookings for property owner',
         'PUT /api/bookings/:id/status': 'Update booking status'
       }
@@ -253,6 +219,7 @@ const startServer = async () => {
       console.log('\nAvailable API Endpoints:');
       console.log(`   Auth routes: http://localhost:${PORT}/api/auth`);
       console.log(`   Property routes: http://localhost:${PORT}/api/properties`);
+      console.log(`   Upload routes: http://localhost:${PORT}/api/upload`);
       console.log(`   User interactions: http://localhost:${PORT}/api/user-interactions`);
       console.log(`   Admin routes: http://localhost:${PORT}/api/admin`);
       console.log(`   Profile routes: http://localhost:${PORT}/api/profile`);
@@ -265,10 +232,11 @@ const startServer = async () => {
     server.on('error', (error) => {
       if (error.code === 'EADDRINUSE') {
         console.error(`Port ${PORT} is already in use. Please use a different port.`);
+        process.exit(1);
       } else {
         console.error('Server error:', error);
+        process.exit(1);
       }
-      process.exit(1);
     });
 
   } catch (error) {
@@ -277,52 +245,46 @@ const startServer = async () => {
   }
 };
 
-const handleShutdown = async (signal) => {
-  console.log(`\nReceived ${signal}. Starting graceful shutdown...`);
+const gracefulShutdownHandler = (signal) => {
+  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
   
   if (server) {
-    server.close(async (err) => {
-      if (err) {
-        console.error('Error closing HTTP server:', err);
-      } else {
-        console.log('HTTP server closed');
-      }
-
-      try {
-        await gracefulShutdown();
-        console.log('Graceful shutdown completed');
-        process.exit(0);
-      } catch (error) {
-        console.error('Error during graceful shutdown:', error);
-        process.exit(1);
-      }
+    server.close(() => {
+      console.log('HTTP server closed.');
+      gracefulShutdown()
+        .then(() => {
+          console.log('Database connections closed.');
+          process.exit(0);
+        })
+        .catch((error) => {
+          console.error('Error during shutdown:', error);
+          process.exit(1);
+        });
     });
-
-    setTimeout(() => {
-      console.error('Forced shutdown due to timeout');
-      process.exit(1);
-    }, 10000);
   } else {
-    process.exit(0);
+    gracefulShutdown()
+      .then(() => {
+        console.log('Database connections closed.');
+        process.exit(0);
+      })
+      .catch((error) => {
+        console.error('Error during shutdown:', error);
+        process.exit(1);
+      });
   }
 };
 
-process.on('SIGTERM', () => handleShutdown('SIGTERM'));
-process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdownHandler('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdownHandler('SIGINT'));
 
 process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', {
-    message: error.message,
-    stack: error.stack,
-    timestamp: new Date().toISOString()
-  });
-  
-  handleShutdown('uncaughtException');
+  console.error('Uncaught Exception:', error);
+  gracefulShutdownHandler('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  handleShutdown('unhandledRejection');
+  gracefulShutdownHandler('unhandledRejection');
 });
 
 startServer();
