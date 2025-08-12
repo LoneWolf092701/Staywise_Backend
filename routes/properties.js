@@ -90,6 +90,10 @@ router.post('/', auth, async (req, res) => {
     };
 
     const billsInclusive = propertyData.bills_inclusive || [];
+    const rules = propertyData.rules || [];
+    const roommates = propertyData.roommates || [];
+    const contractPolicy = propertyData.contract_policy || '';
+    const otherFacility = propertyData.other_facility || '';
 
     const queries = [
       {
@@ -118,8 +122,9 @@ router.post('/', auth, async (req, res) => {
         sql: `INSERT INTO property_details (
           user_id, property_type, unit_type, amenities, facilities, 
           address, available_from, available_to, price_range, bills_inclusive,
+          rules, roommates, contract_policy, other_facility,
           approval_status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW(), NOW())`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW(), NOW())`,
         params: [
           userId,
           propertyData.property_type,
@@ -130,7 +135,11 @@ router.post('/', auth, async (req, res) => {
           propertyData.available_from || null,
           propertyData.available_to || null,
           JSON.stringify(priceRange),
-          JSON.stringify(billsInclusive)
+          JSON.stringify(billsInclusive),
+          JSON.stringify(rules),
+          JSON.stringify(roommates),
+          contractPolicy,
+          otherFacility
         ]
       }
     ];
@@ -205,7 +214,7 @@ router.put('/:id', auth, async (req, res) => {
     const allowedFields = [
       'unit_type', 'address', 'price', 'description', 'amenities', 'facilities',
       'images', 'bedrooms', 'bathrooms', 'available_from', 'available_to',
-      'is_active', 'approval_status'
+      'is_active', 'approval_status', 'rules', 'roommates', 'contract_policy', 'other_facility'
     ];
 
     const updates = {};
@@ -222,7 +231,7 @@ router.put('/:id', auth, async (req, res) => {
           updates[key] = price;
         } else if (key === 'bedrooms' || key === 'bathrooms') {
           updates[key] = parseInt(updateData[key]) || 0;
-        } else if (key === 'amenities' || key === 'facilities' || key === 'images') {
+        } else if (key === 'amenities' || key === 'facilities' || key === 'images' || key === 'rules' || key === 'roommates') {
           const value = Array.isArray(updateData[key]) ? 
                        updateData[key] : 
                        (typeof updateData[key] === 'string' ? 
@@ -271,7 +280,7 @@ router.put('/:id', auth, async (req, res) => {
       const detailsParams = [];
       const detailsSetParts = [];
       
-      ['property_type', 'unit_type', 'amenities', 'facilities', 'address', 'available_from', 'available_to'].forEach(field => {
+      ['property_type', 'unit_type', 'amenities', 'facilities', 'address', 'available_from', 'available_to', 'rules', 'roommates', 'contract_policy', 'other_facility'].forEach(field => {
         if (updates[field] !== undefined) {
           detailsSetParts.push(`${field} = ?`);
           detailsParams.push(updates[field]);
@@ -672,10 +681,15 @@ router.get('/admin/all', auth, async (req, res) => {
         u.username as owner_name,
         u.email as owner_email,
         up.business_name as owner_business_name,
-        up.phone as owner_phone
+        up.phone as owner_phone,
+        pd.rules,
+        pd.roommates,
+        pd.contract_policy,
+        pd.other_facility
       FROM all_properties p
       LEFT JOIN users u ON p.user_id = u.id
       LEFT JOIN user_profiles up ON u.id = up.user_id
+      LEFT JOIN property_details pd ON p.user_id = pd.user_id
       ${whereClause}
       ORDER BY ${sortField} ${sortDirection}
       LIMIT ? OFFSET ?
@@ -698,6 +712,8 @@ router.get('/admin/all', auth, async (req, res) => {
       amenities: safeJsonParse(property.amenities),
       facilities: safeJsonParse(property.facilities),
       images: safeJsonParse(property.images),
+      rules: safeJsonParse(property.rules),
+      roommates: safeJsonParse(property.roommates),
       owner_info: {
         username: property.owner_name,
         email: property.owner_email,
@@ -936,10 +952,15 @@ router.get('/public/:id', async (req, res) => {
             u.email as owner_email,
             prof.phone as owner_phone,
             prof.first_name as owner_first_name,
-            prof.last_name as owner_last_name
+            prof.last_name as owner_last_name,
+            pd.rules,
+            pd.roommates,
+            pd.contract_policy,
+            pd.other_facility
           FROM all_properties p
           LEFT JOIN users u ON p.user_id = u.id
           LEFT JOIN user_profiles prof ON u.id = prof.user_id
+          LEFT JOIN property_details pd ON p.user_id = pd.user_id
           WHERE p.id = ?
         `;
         queryParams = [propertyId];
@@ -951,10 +972,15 @@ router.get('/public/:id', async (req, res) => {
             u.email as owner_email,
             prof.phone as owner_phone,
             prof.first_name as owner_first_name,
-            prof.last_name as owner_last_name
+            prof.last_name as owner_last_name,
+            pd.rules,
+            pd.roommates,
+            pd.contract_policy,
+            pd.other_facility
           FROM all_properties p
           LEFT JOIN users u ON p.user_id = u.id
           LEFT JOIN user_profiles prof ON u.id = prof.user_id
+          LEFT JOIN property_details pd ON p.user_id = pd.user_id
           WHERE p.id = ? AND p.is_active = 1 
             AND (p.approval_status = 'approved' OR p.user_id = ?)
         `;
@@ -968,10 +994,15 @@ router.get('/public/:id', async (req, res) => {
           u.email as owner_email,
           prof.phone as owner_phone,
           prof.first_name as owner_first_name,
-          prof.last_name as owner_last_name
+          prof.last_name as owner_last_name,
+          pd.rules,
+          pd.roommates,
+          pd.contract_policy,
+          pd.other_facility
         FROM all_properties p
         LEFT JOIN users u ON p.user_id = u.id
         LEFT JOIN user_profiles prof ON u.id = prof.user_id
+        LEFT JOIN property_details pd ON p.user_id = pd.user_id
         WHERE p.id = ? AND p.is_active = 1 AND p.approval_status = 'approved'
       `;
       queryParams = [propertyId];
@@ -998,7 +1029,9 @@ router.get('/public/:id', async (req, res) => {
       price: parseFloat(property.price),
       amenities: safeJsonParse(property.amenities),
       facilities: safeJsonParse(property.facilities),
-      images: safeJsonParse(property.images)
+      images: safeJsonParse(property.images),
+      rules: safeJsonParse(property.rules),
+      roommates: safeJsonParse(property.roommates)
     };
 
     res.json(processedProperty);
@@ -1029,9 +1062,14 @@ router.get('/:id', auth, async (req, res) => {
       SELECT 
         p.*,
         u.username as owner_name,
-        u.email as owner_email
+        u.email as owner_email,
+        pd.rules,
+        pd.roommates,
+        pd.contract_policy,
+        pd.other_facility
       FROM all_properties p
       LEFT JOIN users u ON p.user_id = u.id
+      LEFT JOIN property_details pd ON p.user_id = pd.user_id
       WHERE p.id = ?
     `;
 
@@ -1058,7 +1096,9 @@ router.get('/:id', auth, async (req, res) => {
       price: parseFloat(property.price),
       amenities: safeJsonParse(property.amenities),
       facilities: safeJsonParse(property.facilities),
-      images: safeJsonParse(property.images)
+      images: safeJsonParse(property.images),
+      rules: safeJsonParse(property.rules),
+      roommates: safeJsonParse(property.roommates)
     };
 
     res.json(processedProperty);
