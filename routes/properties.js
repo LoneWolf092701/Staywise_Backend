@@ -65,6 +65,17 @@ const validatePropertyData = (propertyData) => {
   return errors;
 };
 
+const formatDateForMySQL = (dateStr) => {
+  if (!dateStr) return null;
+  try {
+    const date = new Date(dateStr);
+    return date.toISOString().split('T')[0];
+  } catch (error) {
+    console.warn('Date formatting error:', error);
+    return null;
+  }
+};
+
 router.get('/public', async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -362,62 +373,64 @@ router.post('/', auth, async (req, res) => {
       delete normalizedFacilities.Bathrooms;
     }
 
-    await executeTransaction(async (connection) => {
-      const propertyQuery = `
-        INSERT INTO all_properties (
+    const availableFromDate = formatDateForMySQL(propertyData.availableFrom);
+    const availableToDate = formatDateForMySQL(propertyData.availableTo);
+
+    const transactionQueries = [
+      {
+        sql: `INSERT INTO all_properties (
           user_id, property_type, unit_type, address, price, amenities, facilities, 
           images, description, bedrooms, bathrooms, available_from, available_to, 
-          is_active, approval_status, views_count, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', 0, NOW(), NOW())
-      `;
-
-      const propertyResult = await connection.execute(propertyQuery, [
-        userId,
-        propertyData.property_type,
-        propertyData.unit_type,
-        propertyData.address,
-        price,
-        JSON.stringify(propertyData.amenities),
-        JSON.stringify(normalizedFacilities),
-        JSON.stringify(propertyData.images || []),
-        propertyData.description,
-        bedrooms,
-        bathrooms,
-        propertyData.availableFrom,
-        propertyData.availableTo || null
-      ]);
-
-      const propertyId = propertyResult[0].insertId;
-
-      const detailsQuery = `
-        INSERT INTO property_details (
-          user_id, property_type, unit_type, amenities, facilities,
+          is_active, approval_status, views_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', 0)`,
+        params: [
+          userId,
+          propertyData.property_type,
+          propertyData.unit_type,
+          propertyData.address,
+          price,
+          JSON.stringify(propertyData.amenities),
+          JSON.stringify(normalizedFacilities),
+          JSON.stringify(propertyData.images || []),
+          propertyData.description,
+          bedrooms,
+          bathrooms,
+          availableFromDate,
+          availableToDate
+        ]
+      },
+      {
+        sql: `INSERT INTO property_details (
+          user_id, property_type, unit_type, amenities, facilities, other_facility,
           roommates, rules, contract_policy, address, available_from, available_to,
-          price_range, bills_inclusive, approval_status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW(), NOW())
-      `;
+          price_range, bills_inclusive, approval_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+        params: [
+          userId,
+          propertyData.property_type,
+          propertyData.unit_type,
+          JSON.stringify(propertyData.amenities),
+          JSON.stringify(normalizedFacilities),
+          propertyData.otherFacility || propertyData.other_facility || '',
+          JSON.stringify(propertyData.roommates || []),
+          JSON.stringify(propertyData.rules || []),
+          propertyData.contractPolicy,
+          propertyData.address,
+          availableFromDate,
+          availableToDate,
+          JSON.stringify({ min: price, max: price }),
+          JSON.stringify(propertyData.billsInclusive || [])
+        ]
+      }
+    ];
 
-      await connection.execute(detailsQuery, [
-        userId,
-        propertyData.property_type,
-        propertyData.unit_type,
-        JSON.stringify(propertyData.amenities),
-        JSON.stringify(normalizedFacilities),
-        JSON.stringify(propertyData.roommates || []),
-        JSON.stringify(propertyData.rules || []),
-        propertyData.contractPolicy,
-        propertyData.address,
-        propertyData.availableFrom,
-        propertyData.availableTo || null,
-        JSON.stringify({ min: price, max: price }),
-        JSON.stringify(propertyData.billsInclusive || [])
-      ]);
+    const results = await executeTransaction(transactionQueries);
+    const propertyId = results[0].insertId;
 
-      res.status(201).json({
-        message: 'Property created successfully',
-        property_id: propertyId,
-        approval_status: 'pending'
-      });
+    res.status(201).json({
+      message: 'Property created successfully',
+      property_id: propertyId,
+      approval_status: 'pending'
     });
 
   } catch (error) {
@@ -482,57 +495,59 @@ router.put('/:id', auth, async (req, res) => {
     const bedrooms = normalizedFacilities?.Bedroom ? parseInt(normalizedFacilities.Bedroom) : 0;
     const bathrooms = normalizedFacilities?.Bathroom ? parseInt(normalizedFacilities.Bathroom) : 0;
 
-    await executeTransaction(async (connection) => {
-      const updatePropertyQuery = `
-        UPDATE all_properties 
+    const availableFromDate = formatDateForMySQL(updateData.available_from || updateData.availableFrom);
+    const availableToDate = formatDateForMySQL(updateData.available_to || updateData.availableTo);
+
+    const transactionQueries = [
+      {
+        sql: `UPDATE all_properties 
         SET property_type = ?, unit_type = ?, address = ?, price = ?, 
             amenities = ?, facilities = ?, images = ?, description = ?, 
-            bedrooms = ?, bathrooms = ?, available_from = ?, available_to = ?, 
-            updated_at = NOW()
-        WHERE id = ? AND user_id = ?
-      `;
-
-      await connection.execute(updatePropertyQuery, [
-        updateData.property_type || updateData.propertyType,
-        updateData.unit_type || updateData.unitType,
-        updateData.address,
-        parseFloat(updateData.price),
-        JSON.stringify(updateData.amenities || {}),
-        JSON.stringify(normalizedFacilities || {}),
-        JSON.stringify(updateData.images || []),
-        updateData.description,
-        bedrooms,
-        bathrooms,
-        updateData.available_from || updateData.availableFrom,
-        updateData.available_to || updateData.availableTo,
-        propertyId,
-        userId
-      ]);
-
-      const updateDetailsQuery = `
-        UPDATE property_details 
+            bedrooms = ?, bathrooms = ?, available_from = ?, available_to = ?
+        WHERE id = ? AND user_id = ?`,
+        params: [
+          updateData.property_type || updateData.propertyType,
+          updateData.unit_type || updateData.unitType,
+          updateData.address,
+          parseFloat(updateData.price),
+          JSON.stringify(updateData.amenities || {}),
+          JSON.stringify(normalizedFacilities || {}),
+          JSON.stringify(updateData.images || []),
+          updateData.description,
+          bedrooms,
+          bathrooms,
+          availableFromDate,
+          availableToDate,
+          propertyId,
+          userId
+        ]
+      },
+      {
+        sql: `UPDATE property_details 
         SET property_type = ?, unit_type = ?, amenities = ?, facilities = ?, 
-            rules = ?, contract_policy = ?, address = ?, 
+            other_facility = ?, rules = ?, contract_policy = ?, address = ?, 
             available_from = ?, available_to = ?, roommates = ?, 
-            bills_inclusive = ?, updated_at = NOW()
-        WHERE user_id = ?
-      `;
+            bills_inclusive = ?
+        WHERE user_id = ?`,
+        params: [
+          updateData.property_type || updateData.propertyType,
+          updateData.unit_type || updateData.unitType,
+          JSON.stringify(updateData.amenities || {}),
+          JSON.stringify(normalizedFacilities || {}),
+          updateData.otherFacility || updateData.other_facility || '',
+          JSON.stringify(updateData.rules || []),
+          updateData.contract_policy || updateData.contractPolicy,
+          updateData.address,
+          availableFromDate,
+          availableToDate,
+          JSON.stringify(updateData.roommates || []),
+          JSON.stringify(updateData.bills_inclusive || updateData.billsInclusive || []),
+          userId
+        ]
+      }
+    ];
 
-      await connection.execute(updateDetailsQuery, [
-        updateData.property_type || updateData.propertyType,
-        updateData.unit_type || updateData.unitType,
-        JSON.stringify(updateData.amenities || {}),
-        JSON.stringify(normalizedFacilities || {}),
-        JSON.stringify(updateData.rules || []),
-        updateData.contract_policy || updateData.contractPolicy,
-        updateData.address,
-        updateData.available_from || updateData.availableFrom,
-        updateData.available_to || updateData.availableTo,
-        JSON.stringify(updateData.roommates || []),
-        JSON.stringify(updateData.bills_inclusive || updateData.billsInclusive || []),
-        userId
-      ]);
-    });
+    await executeTransaction(transactionQueries);
 
     res.json({
       message: 'Property updated successfully',
@@ -582,17 +597,18 @@ router.delete('/:id', auth, async (req, res) => {
 
     const property = existingProperty[0];
 
-    await executeTransaction(async (connection) => {
-      await connection.execute(
-        'DELETE FROM property_details WHERE user_id = ?',
-        [property.user_id]
-      );
-      
-      await connection.execute(
-        `DELETE FROM all_properties WHERE ${whereClause}`,
-        queryParams
-      );
-    });
+    const transactionQueries = [
+      {
+        sql: 'DELETE FROM property_details WHERE user_id = ?',
+        params: [property.user_id]
+      },
+      {
+        sql: `DELETE FROM all_properties WHERE ${whereClause}`,
+        params: queryParams
+      }
+    ];
+
+    await executeTransaction(transactionQueries);
 
     res.json({
       message: 'Property deleted successfully',
@@ -669,7 +685,6 @@ router.patch('/:id/status', auth, async (req, res) => {
       });
     }
 
-    allPropsSetParts.push('updated_at = NOW()');
     allPropsParams.push(propertyId);
 
     await query(
@@ -698,26 +713,27 @@ router.post('/:id/details', auth, requirePropertyOwnership, async (req, res) => 
   const detailsData = req.body;
 
   try {
-    await executeTransaction(async (connection) => {
-      await connection.execute(
-        'DELETE FROM property_details WHERE user_id = ? AND property_id = ?',
-        [userId, propertyId]
-      );
+    const transactionQueries = [
+      {
+        sql: 'DELETE FROM property_details WHERE user_id = ? AND property_id = ?',
+        params: [userId, propertyId]
+      }
+    ];
 
-      if (detailsData && Object.keys(detailsData).length > 0) {
-        const insertQuery = `
-          INSERT INTO property_details (
-            user_id, property_id, details_data, created_at, updated_at
-          ) VALUES (?, ?, ?, NOW(), NOW())
-        `;
-
-        await connection.execute(insertQuery, [
+    if (detailsData && Object.keys(detailsData).length > 0) {
+      transactionQueries.push({
+        sql: `INSERT INTO property_details (
+          user_id, property_id, details_data
+        ) VALUES (?, ?, ?)`,
+        params: [
           userId,
           propertyId,
           JSON.stringify(detailsData)
-        ]);
-      }
-    });
+        ]
+      });
+    }
+
+    await executeTransaction(transactionQueries);
 
     res.json({
       message: 'Property details updated successfully',
