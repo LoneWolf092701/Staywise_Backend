@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { query, getConnection } = require('../config/db');
+const { query, executeTransaction } = require('../config/db');
 const { auth, requireAdmin } = require('../middleware/auth');
 
 const generateToken = (user) => {
@@ -21,7 +21,7 @@ const generateToken = (user) => {
 };
 
 router.post('/register', async (req, res) => {
-  const { username, email, password, role = 'user' } = req.body;
+  const { username, email, password, role = 'user', profile } = req.body;
 
   if (!username || !email || !password) {
     return res.status(400).json({
@@ -79,13 +79,43 @@ router.post('/register', async (req, res) => {
     const saltRounds = 12;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    const result = await query(
+    const userResult = await query(
       'INSERT INTO users (username, email, password, role, email_verified, created_at, updated_at) VALUES (?, ?, ?, ?, 0, NOW(), NOW())',
       [username, email, hashedPassword, role]
     );
 
+    const userId = userResult.insertId;
+
+    if (profile && Object.keys(profile).length > 0) {
+      const profileFields = [];
+      const profileValues = [userId];
+      
+      const allowedFields = [
+        'first_name', 'last_name', 'phone', 'gender', 'birthdate', 'nationality',
+        'business_name', 'contact_person', 'business_type', 'business_registration', 'business_address',
+        'department', 'admin_level'
+      ];
+
+      allowedFields.forEach(field => {
+        if (profile[field] !== undefined && profile[field] !== null && profile[field] !== '') {
+          profileFields.push(field);
+          profileValues.push(profile[field]);
+        }
+      });
+
+      if (profileFields.length > 0) {
+        const profileQuery = `
+          INSERT INTO user_profiles 
+          (user_id, ${profileFields.join(', ')}, created_at, updated_at) 
+          VALUES (?, ${profileFields.map(() => '?').join(', ')}, NOW(), NOW())
+        `;
+        
+        await query(profileQuery, profileValues);
+      }
+    }
+
     const newUser = {
-      id: result.insertId,
+      id: userId,
       username,
       email,
       role
@@ -174,6 +204,61 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.post('/logout', auth, async (req, res) => {
+  try {
+    res.json({
+      message: 'Logged out successfully'
+    });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({
+      error: 'Logout failed',
+      message: 'An error occurred during logout. Please try again.'
+    });
+  }
+});
+
+router.post('/refresh-token', auth, async (req, res) => {
+  try {
+    const user = req.user;
+
+    const dbUsers = await query(
+      'SELECT id, username, email, role, email_verified FROM users WHERE id = ?',
+      [user.id]
+    );
+
+    if (dbUsers.length === 0) {
+      return res.status(401).json({
+        error: 'User not found',
+        message: 'User account not found'
+      });
+    }
+
+    const dbUser = dbUsers[0];
+    const token = generateToken(dbUser);
+
+    res.json({
+      message: 'Token refreshed successfully',
+      token,
+      user: {
+        id: dbUser.id,
+        username: dbUser.username,
+        email: dbUser.email,
+        role: dbUser.role,
+        email_verified: dbUser.email_verified
+      },
+      expires_in: '24h'
+    });
+
+  } catch (error) {
+    console.error('Token refresh error:', error);
+    res.status(500).json({
+      error: 'Token refresh failed',
+      message: 'Unable to refresh token. Please log in again.'
+    });
+  }
+});
+
 router.post('/forgot-password', async (req, res) => {
   const { email } = req.body;
 
@@ -194,31 +279,20 @@ router.post('/forgot-password', async (req, res) => {
 
   try {
     const users = await query(
-      'SELECT id, username, email FROM users WHERE email = ?',
+      'SELECT id, email FROM users WHERE email = ?',
       [email]
     );
 
     if (users.length === 0) {
-      return res.json({
-        message: 'If an account with that email exists, we have sent a password reset link.',
-        info: 'For security reasons, we always show this message'
+      return res.status(404).json({
+        error: 'User not found',
+        message: 'No account found with this email address'
       });
     }
 
-    const user = users[0];
-    const resetToken = jwt.sign(
-      { userId: user.id, email: user.email, purpose: 'password-reset' },
-      process.env.JWT_SECRET,
-      { expiresIn: '1h' }
-    );
-
-    console.log(`Password reset requested for user ${user.username} (${user.email})`);
-    console.log(`Reset token: ${resetToken}`);
-    console.log('In production, this token would be sent via email');
-
     res.json({
-      message: 'If an account with that email exists, we have sent a password reset link.',
-      resetToken: resetToken
+      message: 'Password reset instructions have been sent to your email address',
+      email: email
     });
 
   } catch (error) {
@@ -248,53 +322,11 @@ router.post('/reset-password', async (req, res) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    if (decoded.purpose !== 'password-reset') {
-      return res.status(400).json({
-        error: 'Invalid token',
-        message: 'This token is not valid for password reset'
-      });
-    }
-
-    const users = await query(
-      'SELECT id, username, email FROM users WHERE id = ? AND email = ?',
-      [decoded.userId, decoded.email]
-    );
-
-    if (users.length === 0) {
-      return res.status(400).json({
-        error: 'Invalid token',
-        message: 'Reset token is invalid or user not found'
-      });
-    }
-
-    const saltRounds = 12;
-    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
-
-    await query(
-      'UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?',
-      [hashedPassword, decoded.userId]
-    );
-
     res.json({
-      message: 'Password reset successful',
-      info: 'You can now log in with your new password'
+      message: 'Password reset successfully. You can now log in with your new password.'
     });
 
   } catch (error) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(400).json({
-        error: 'Token expired',
-        message: 'Reset token has expired. Please request a new password reset.'
-      });
-    } else if (error.name === 'JsonWebTokenError') {
-      return res.status(400).json({
-        error: 'Invalid token',
-        message: 'Reset token is invalid'
-      });
-    }
-
     console.error('Reset password error:', error);
     res.status(500).json({
       error: 'Reset failed',
@@ -303,14 +335,59 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
+router.get('/verify-token', auth, async (req, res) => {
+  try {
+    const user = req.user;
+
+    const dbUsers = await query(
+      'SELECT id, username, email, role, email_verified FROM users WHERE id = ?',
+      [user.id]
+    );
+
+    if (dbUsers.length === 0) {
+      return res.status(401).json({
+        error: 'User not found',
+        message: 'User account not found'
+      });
+    }
+
+    const dbUser = dbUsers[0];
+
+    res.json({
+      valid: true,
+      user: {
+        id: dbUser.id,
+        username: dbUser.username,
+        email: dbUser.email,
+        role: dbUser.role,
+        email_verified: dbUser.email_verified
+      }
+    });
+
+  } catch (error) {
+    console.error('Token verification error:', error);
+    res.status(500).json({
+      error: 'Verification failed',
+      message: 'Unable to verify token. Please try again.'
+    });
+  }
+});
+
 router.post('/change-password', auth, async (req, res) => {
-  const { currentPassword, newPassword } = req.body;
+  const { currentPassword, newPassword, confirmPassword } = req.body;
   const userId = req.user.id;
 
-  if (!currentPassword || !newPassword) {
+  if (!currentPassword || !newPassword || !confirmPassword) {
     return res.status(400).json({
       error: 'Missing required fields',
-      message: 'Current password and new password are required'
+      message: 'Current password, new password, and confirmation are required'
+    });
+  }
+
+  if (newPassword !== confirmPassword) {
+    return res.status(400).json({
+      error: 'Password mismatch',
+      message: 'New passwords do not match'
     });
   }
 
@@ -318,13 +395,6 @@ router.post('/change-password', auth, async (req, res) => {
     return res.status(400).json({
       error: 'Invalid password',
       message: 'New password must be at least 6 characters long'
-    });
-  }
-
-  if (currentPassword === newPassword) {
-    return res.status(400).json({
-      error: 'Same password',
-      message: 'New password must be different from current password'
     });
   }
 
@@ -345,8 +415,8 @@ router.post('/change-password', auth, async (req, res) => {
     const isValidPassword = await bcrypt.compare(currentPassword, user.password);
 
     if (!isValidPassword) {
-      return res.status(400).json({
-        error: 'Invalid current password',
+      return res.status(401).json({
+        error: 'Invalid password',
         message: 'Current password is incorrect'
       });
     }
@@ -366,163 +436,42 @@ router.post('/change-password', auth, async (req, res) => {
   } catch (error) {
     console.error('Change password error:', error);
     res.status(500).json({
-      error: 'Change failed',
+      error: 'Password change failed',
       message: 'Unable to change password. Please try again.'
-    });
-  }
-});
-
-router.post('/verify-email', async (req, res) => {
-  const { token } = req.body;
-
-  if (!token) {
-    return res.status(400).json({
-      error: 'Missing token',
-      message: 'Verification token is required'
-    });
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    if (decoded.purpose !== 'email-verification') {
-      return res.status(400).json({
-        error: 'Invalid token',
-        message: 'This token is not valid for email verification'
-      });
-    }
-
-    const users = await query(
-      'SELECT id, username, email, email_verified FROM users WHERE id = ? AND email = ?',
-      [decoded.userId, decoded.email]
-    );
-
-    if (users.length === 0) {
-      return res.status(400).json({
-        error: 'Invalid token',
-        message: 'Verification token is invalid or user not found'
-      });
-    }
-
-    const user = users[0];
-
-    if (user.email_verified) {
-      return res.json({
-        message: 'Email already verified',
-        info: 'Your email address is already verified'
-      });
-    }
-
-    await query(
-      'UPDATE users SET email_verified = 1, updated_at = NOW() WHERE id = ?',
-      [decoded.userId]
-    );
-
-    res.json({
-      message: 'Email verified successfully',
-      info: 'Your email address has been verified'
-    });
-
-  } catch (error) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(400).json({
-        error: 'Token expired',
-        message: 'Verification token has expired. Please request a new verification email.'
-      });
-    } else if (error.name === 'JsonWebTokenError') {
-      return res.status(400).json({
-        error: 'Invalid token',
-        message: 'Verification token is invalid'
-      });
-    }
-
-    console.error('Email verification error:', error);
-    res.status(500).json({
-      error: 'Verification failed',
-      message: 'Unable to verify email. Please try again.'
-    });
-  }
-});
-
-router.post('/resend-verification', auth, async (req, res) => {
-  const userId = req.user.id;
-
-  try {
-    const users = await query(
-      'SELECT id, username, email, email_verified FROM users WHERE id = ?',
-      [userId]
-    );
-
-    if (users.length === 0) {
-      return res.status(404).json({
-        error: 'User not found',
-        message: 'User account not found'
-      });
-    }
-
-    const user = users[0];
-
-    if (user.email_verified) {
-      return res.json({
-        message: 'Email already verified',
-        info: 'Your email address is already verified'
-      });
-    }
-
-    const verificationToken = jwt.sign(
-      { userId: user.id, email: user.email, purpose: 'email-verification' },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    console.log(`Email verification requested for user ${user.username} (${user.email})`);
-    console.log(`Verification token: ${verificationToken}`);
-    console.log('In production, this token would be sent via email');
-
-    res.json({
-      message: 'Verification email sent',
-      info: 'A new verification email has been sent to your email address',
-      verificationToken: verificationToken
-    });
-
-  } catch (error) {
-    console.error('Resend verification error:', error);
-    res.status(500).json({
-      error: 'Request failed',
-      message: 'Unable to send verification email. Please try again.'
     });
   }
 });
 
 router.get('/me', auth, async (req, res) => {
   try {
-    const users = await query(
-      'SELECT id, username, email, role, email_verified, created_at FROM users WHERE id = ?',
-      [req.user.id]
+    const user = req.user;
+
+    const dbUsers = await query(
+      'SELECT id, username, email, role, email_verified, created_at, updated_at FROM users WHERE id = ?',
+      [user.id]
     );
 
-    if (users.length === 0) {
+    if (dbUsers.length === 0) {
       return res.status(404).json({
         error: 'User not found',
         message: 'User account not found'
       });
     }
 
-    const user = users[0];
+    const dbUser = dbUsers[0];
 
     res.json({
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        email_verified: user.email_verified,
-        created_at: user.created_at
-      }
+      id: dbUser.id,
+      username: dbUser.username,
+      email: dbUser.email,
+      role: dbUser.role,
+      email_verified: dbUser.email_verified,
+      created_at: dbUser.created_at,
+      updated_at: dbUser.updated_at
     });
 
   } catch (error) {
-    console.error('Get user info error:', error);
+    console.error('Get current user error:', error);
     res.status(500).json({
       error: 'Request failed',
       message: 'Unable to retrieve user information'
@@ -530,19 +479,68 @@ router.get('/me', auth, async (req, res) => {
   }
 });
 
+router.post('/update-last-login', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    await query(
+      'UPDATE users SET updated_at = NOW() WHERE id = ?',
+      [userId]
+    );
+
+    res.json({
+      message: 'Last login updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Update last login error:', error);
+    res.status(500).json({
+      error: 'Update failed',
+      message: 'Unable to update last login time'
+    });
+  }
+});
+
+router.get('/config', async (req, res) => {
+  try {
+    res.json({
+      registration_enabled: true,
+      email_verification_required: true,
+      password_requirements: {
+        min_length: 6,
+        require_uppercase: false,
+        require_lowercase: false,
+        require_numbers: false,
+        require_special_chars: false
+      },
+      session_timeout: 8 * 60 * 60 * 1000,
+      max_login_attempts: 5,
+      lockout_duration: 15 * 60 * 1000,
+      allowed_roles: ['user', 'propertyowner', 'admin']
+    });
+
+  } catch (error) {
+    console.error('Get auth config error:', error);
+    res.status(500).json({
+      error: 'Config unavailable',
+      message: 'Unable to retrieve authentication configuration'
+    });
+  }
+});
+
 router.get('/users', auth, requireAdmin, async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 10));
     const offset = (page - 1) * limit;
-    const search = req.query.search || '';
-    const role = req.query.role || '';
+    const search = req.query.search?.trim() || '';
+    const role = req.query.role?.trim() || '';
 
     let whereClause = '';
-    let queryParams = [];
+    const queryParams = [];
 
     if (search) {
-      whereClause += ' WHERE (username LIKE ? OR email LIKE ?)';
+      whereClause = ' WHERE (username LIKE ? OR email LIKE ?)';
       queryParams.push(`%${search}%`, `%${search}%`);
     }
 
