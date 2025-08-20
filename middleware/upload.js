@@ -4,7 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 
-const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || 
+const AZURE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING || 
   'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;';
 
 const CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'staywise-uploads';
@@ -74,32 +74,65 @@ const upload = multer({
   fileFilter: validateFileType
 });
 
-const uploadToAzure = async (file, folder = 'uploads') => {
-  if (!blobServiceClient || azureConnectionFailed) {
-    console.warn('Azure Blob Storage not available, using fallback');
-    const timestamp = Date.now();
-    const randomString = crypto.randomBytes(8).toString('hex');
-    const fileExtension = path.extname(file.originalname);
-    const fileName = `${folder}/${timestamp}-${randomString}${fileExtension}`;
+const createLocalFallback = (file, folder) => {
+  const timestamp = Date.now();
+  const randomString = crypto.randomBytes(8).toString('hex');
+  const fileExtension = path.extname(file.originalname);
+  const fileName = `${folder}/${timestamp}-${randomString}${fileExtension}`;
+  
+  const uploadsDir = path.join(__dirname, '..', 'uploads', folder);
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+  
+  const filePath = path.join(uploadsDir, `${timestamp}-${randomString}${fileExtension}`);
+  fs.writeFileSync(filePath, file.buffer);
+  
+  return {
+    url: `http://localhost:5000/uploads/${fileName}`,
+    filename: fileName,
+    originalname: file.originalname,
+    size: file.size,
+    mimetype: file.mimetype,
+    container: 'local-storage'
+  };
+};
+
+const testAzureConnection = async () => {
+  try {
+    if (!blobServiceClient || azureConnectionFailed) {
+      return false;
+    }
     
-    return {
-      url: `http://localhost:5000/uploads/${fileName}`,
-      filename: fileName,
-      originalname: file.originalname,
-      size: file.size,
-      mimetype: file.mimetype,
-      container: 'local-fallback'
-    };
+    const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
+    await containerClient.getProperties();
+    return true;
+  } catch (error) {
+    console.error('Azure connection test failed:', error);
+    return false;
+  }
+};
+
+const uploadToAzure = async (file, folder = 'uploads') => {
+  const timestamp = Date.now();
+  const randomString = crypto.randomBytes(8).toString('hex');
+  const fileExtension = path.extname(file.originalname);
+  const fileName = `${folder}/${timestamp}-${randomString}${fileExtension}`;
+
+  console.log(`\n=== Upload Attempt ===`);
+  console.log(`File: ${file.originalname}`);
+  console.log(`Size: ${file.size} bytes`);
+  console.log(`Target: ${fileName}`);
+
+  const azureConnected = await testAzureConnection();
+  if (!azureConnected) {
+    console.log('Azure not available, using local fallback');
+    return createLocalFallback(file, folder);
   }
 
   try {
+    console.log('Attempting Azure upload...');
     const containerClient = await initializeContainer();
-    
-    const timestamp = Date.now();
-    const randomString = crypto.randomBytes(8).toString('hex');
-    const fileExtension = path.extname(file.originalname);
-    const fileName = `${folder}/${timestamp}-${randomString}${fileExtension}`;
-    
     const blockBlobClient = containerClient.getBlockBlobClient(fileName);
     
     const uploadOptions = {
@@ -114,10 +147,22 @@ const uploadToAzure = async (file, folder = 'uploads') => {
       }
     };
     
-    await blockBlobClient.upload(file.buffer, file.size, uploadOptions);
+    const uploadResponse = await blockBlobClient.upload(file.buffer, file.size, uploadOptions);
+    console.log('Azure upload response:', uploadResponse);
+    
+    if (!uploadResponse || !uploadResponse.requestId) {
+      throw new Error('Azure upload failed - no response');
+    }
     
     const baseUrl = blobServiceClient.url.replace(/\/$/, '');
     const blobUrl = `${baseUrl}/${CONTAINER_NAME}/${fileName}`;
+    
+    console.log(`✅ Azure upload successful: ${blobUrl}`);
+    
+    const exists = await blockBlobClient.exists();
+    if (!exists) {
+      throw new Error('File upload reported success but blob does not exist');
+    }
     
     return {
       url: blobUrl,
@@ -128,22 +173,10 @@ const uploadToAzure = async (file, folder = 'uploads') => {
       container: CONTAINER_NAME
     };
   } catch (error) {
-    console.error('Error uploading to Azure:', error);
-    console.warn('Falling back to local upload simulation');
+    console.error('❌ Azure upload failed:', error.message);
+    console.log('Falling back to local storage...');
     
-    const timestamp = Date.now();
-    const randomString = crypto.randomBytes(8).toString('hex');
-    const fileExtension = path.extname(file.originalname);
-    const fileName = `${folder}/${timestamp}-${randomString}${fileExtension}`;
-    
-    return {
-      url: `http://localhost:5000/uploads/${fileName}`,
-      filename: fileName,
-      originalname: file.originalname,
-      size: file.size,
-      mimetype: file.mimetype,
-      container: 'local-fallback'
-    };
+    return createLocalFallback(file, folder);
   }
 };
 

@@ -367,7 +367,10 @@ router.get('/property-rating/:property_id', optionalAuth, async (req, res) => {
     );
 
     const totalRatings = overallStats[0]?.total_ratings || 0;
-    const averageRating = overallStats[0]?.average_rating || 0;
+    const rawAverageRating = overallStats[0]?.average_rating || 0;
+    
+    // Safely handle averageRating conversion
+    const averageRating = rawAverageRating && !isNaN(rawAverageRating) ? parseFloat(rawAverageRating) : 0;
 
     const response = {
       property_id: parseInt(property_id),
@@ -477,7 +480,14 @@ router.get('/statistics/:property_id', optionalAuth, async (req, res) => {
             processedStats.total_favorites = stat.count;
           } else if (stat.interaction_type === 'rating') {
             processedStats.total_ratings = stat.count;
-            processedStats.average_rating = stat.avg_rating ? parseFloat(stat.avg_rating.toFixed(2)) : 0;
+            // Safely handle avg_rating conversion
+            const rawAvgRating = stat.avg_rating;
+            if (rawAvgRating && !isNaN(rawAvgRating)) {
+              const avgRating = parseFloat(rawAvgRating);
+              processedStats.average_rating = parseFloat(avgRating.toFixed(2));
+            } else {
+              processedStats.average_rating = 0;
+            }
           } else if (stat.interaction_type === 'complaint') {
             processedStats.total_complaints = stat.count;
           } else if (stat.interaction_type === 'view') {
@@ -500,12 +510,16 @@ router.get('/statistics/:property_id', optionalAuth, async (req, res) => {
       );
 
       const stats = publicStats[0] || {};
+      
+      // Safely handle average_rating conversion
+      const rawAvgRating = stats.average_rating || 0;
+      const avgRating = rawAvgRating && !isNaN(rawAvgRating) ? parseFloat(rawAvgRating) : 0;
 
       res.json({
         property_id: parseInt(property_id),
         total_views: property.views_count || 0,
         total_ratings: stats.total_ratings || 0,
-        average_rating: parseFloat((stats.average_rating || 0).toFixed(2)),
+        average_rating: parseFloat(avgRating.toFixed(2)),
         total_favorites: stats.total_favorites || 0
       });
     }

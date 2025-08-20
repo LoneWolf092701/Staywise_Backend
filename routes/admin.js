@@ -442,14 +442,65 @@ router.get('/bookings', auth, requireAdmin, async (req, res) => {
     } = req.query;
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
+    
+    let whereClause = 'WHERE 1=1';
+    const params = [];
+
+    if (status && status !== 'all') {
+      whereClause += ' AND br.status = ?';
+      params.push(status);
+    }
+
+    if (property_id) {
+      whereClause += ' AND br.property_id = ?';
+      params.push(parseInt(property_id));
+    }
+
+    if (user_id) {
+      whereClause += ' AND br.user_id = ?';
+      params.push(parseInt(user_id));
+    }
+
+    const countQuery = `SELECT COUNT(*) as total FROM booking_requests br ${whereClause}`;
+    const countResult = await query(countQuery, params);
+    const total = countResult[0].total;
+
+    const allowedSortFields = ['created_at', 'updated_at', 'check_in_date', 'total_price', 'advance_amount', 'status'];
+    const sortField = allowedSortFields.includes(sort_by) ? `br.${sort_by}` : 'br.created_at';
+    const sortDirection = sort_order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+    const bookingsQuery = `
+      SELECT 
+        br.*,
+        ap.property_type, ap.unit_type, ap.address as property_address,
+        u.username as tenant_username, u.email as tenant_email,
+        owner.username as owner_username
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      INNER JOIN users u ON br.user_id = u.id
+      INNER JOIN users owner ON br.property_owner_id = owner.id
+      ${whereClause}
+      ORDER BY ${sortField} ${sortDirection}
+      LIMIT ? OFFSET ?
+    `;
+
+    params.push(parseInt(limit), offset);
+    const bookings = await query(bookingsQuery, params);
+
+    const processedBookings = bookings.map(booking => ({
+      ...booking,
+      advance_amount: parseFloat(booking.advance_amount),
+      total_price: parseFloat(booking.total_price),
+      service_fee: parseFloat(booking.service_fee)
+    }));
 
     res.json({
-      bookings: [],
+      bookings: processedBookings,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: 0,
-        totalPages: 0
+        total: total,
+        totalPages: Math.ceil(total / parseInt(limit))
       }
     });
 

@@ -1,7 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { query, executeTransaction } = require('../config/db');
-const { auth, requirePropertyOwnership } = require('../middleware/auth');
+const { auth, requirePropertyOwner, requirePropertyOwnership, optionalAuth } = require('../middleware/auth');
+const dayjs = require('dayjs');
+const multer = require('multer');
+const path = require('path');
 
 const safeJsonParse = (str) => {
   try {
@@ -12,138 +15,218 @@ const safeJsonParse = (str) => {
   }
 };
 
-const validatePropertyData = (propertyData) => {
-  const errors = [];
-
-  if (!propertyData.property_type || typeof propertyData.property_type !== 'string') {
-    errors.push('Property type is required');
-  }
-
-  if (!propertyData.unit_type || typeof propertyData.unit_type !== 'string') {
-    errors.push('Unit type is required');
-  }
-
-  if (!propertyData.address || typeof propertyData.address !== 'string') {
-    errors.push('Address is required');
-  }
-
-  if (!propertyData.description || typeof propertyData.description !== 'string') {
-    errors.push('Description is required');
-  }
-
-  if (!propertyData.price || isNaN(parseFloat(propertyData.price)) || parseFloat(propertyData.price) <= 0) {
-    errors.push('Price must be a positive number');
-  }
-
-  if (!propertyData.availableFrom) {
-    errors.push('Available from date is required');
-  }
-
-  if (!propertyData.contractPolicy || typeof propertyData.contractPolicy !== 'string') {
-    errors.push('Contract policy is required');
-  }
-
-  if (!propertyData.amenities || typeof propertyData.amenities !== 'object') {
-    errors.push('Amenities information is required');
-  }
-
-  if (!propertyData.facilities || typeof propertyData.facilities !== 'object') {
-    errors.push('Facilities information is required');
-  } else {
-    const facilities = propertyData.facilities;
-    const bathroomCount = parseInt(facilities.Bathroom || facilities.Bathrooms || 0);
-    const bedroomCount = parseInt(facilities.Bedroom || facilities.Bedrooms || 0);
-    
-    if (bathroomCount < 1) {
-      errors.push('At least 1 bathroom is required');
-    }
-    if (bedroomCount < 0) {
-      errors.push('Bedrooms cannot be negative');
-    }
-  }
-
-  return errors;
+const processPropertyData = (property) => {
+  return {
+    ...property,
+    price: parseFloat(property.price),
+    amenities: safeJsonParse(property.amenities),
+    facilities: safeJsonParse(property.facilities),
+    images: safeJsonParse(property.images),
+    rules: safeJsonParse(property.rules),
+    roommates: safeJsonParse(property.roommates),
+    bills_inclusive: safeJsonParse(property.bills_inclusive)
+  };
 };
 
-const formatDateForMySQL = (dateStr) => {
-  if (!dateStr) return null;
-  try {
-    const date = new Date(dateStr);
-    return date.toISOString().split('T')[0];
-  } catch (error) {
-    console.warn('Date formatting error:', error);
-    return null;
+const validatePropertyId = (propertyId) => {
+  const id = parseInt(propertyId);
+  if (isNaN(id) || id <= 0) {
+    throw new Error('Invalid property ID');
   }
+  return id;
 };
 
+const handleApiError = (error, operation) => {
+  console.error(`Error ${operation}:`, error);
+  if (error.response?.status === 403) {
+    throw new Error('You do not have permission for this action.');
+  } else if (error.response?.status === 404) {
+    throw new Error('Property not found');
+  } else if (error.response?.status >= 500) {
+    throw new Error('Server error. Please try again later.');
+  }
+  throw new Error(error.response?.data?.message || `Failed to ${operation}`);
+};
+
+// Storage configuration for property images
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+    files: 10 // Maximum 10 files
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only image files (JPEG, JPG, PNG, WebP) are allowed'));
+    }
+  }
+});
+
+/**
+ * GET /api/properties/public
+ * Get all public properties with filtering and pagination
+ */
 router.get('/public', async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const limit = Math.min(parseInt(req.query.limit) || 12, 50);
     const offset = (page - 1) * limit;
-    
-    const search = req.query.search || '';
-    const property_type = req.query.property_type || '';
-    const min_price = req.query.min_price ? parseFloat(req.query.min_price) : null;
-    const max_price = req.query.max_price ? parseFloat(req.query.max_price) : null;
-    const location = req.query.location || '';
-    const sort_by = req.query.sort_by || 'created_at';
-    const sort_order = req.query.sort_order === 'asc' ? 'ASC' : 'DESC';
+    const { 
+      search, 
+      property_type, 
+      unit_type, 
+      min_price, 
+      max_price, 
+      min_bedrooms,
+      max_bedrooms,
+      min_bathrooms,
+      max_bathrooms,
+      amenities, 
+      facilities,
+      location,
+      available_from,
+      available_to,
+      sort_by = 'created_at',
+      sort_order = 'DESC'
+    } = req.query;
 
-    let whereConditions = ['approval_status = ?', 'is_active = ?'];
+    let whereClause = 'WHERE approval_status = ? AND is_active = ?';
     let queryParams = ['approved', 1];
 
+    // Search functionality
     if (search) {
-      whereConditions.push('(property_type LIKE ? OR unit_type LIKE ? OR address LIKE ? OR description LIKE ?)');
-      const searchPattern = `%${search}%`;
-      queryParams.push(searchPattern, searchPattern, searchPattern, searchPattern);
+      whereClause += ' AND (address LIKE ? OR property_type LIKE ? OR unit_type LIKE ? OR description LIKE ?)';
+      const searchTerm = `%${search}%`;
+      queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
     }
 
+    // Property type filter
     if (property_type) {
-      whereConditions.push('property_type = ?');
+      whereClause += ' AND property_type = ?';
       queryParams.push(property_type);
     }
 
-    if (min_price !== null) {
-      whereConditions.push('price >= ?');
-      queryParams.push(min_price);
+    // Unit type filter
+    if (unit_type) {
+      whereClause += ' AND unit_type = ?';
+      queryParams.push(unit_type);
     }
 
-    if (max_price !== null) {
-      whereConditions.push('price <= ?');
-      queryParams.push(max_price);
+    // Price range filters
+    if (min_price !== null && min_price !== undefined) {
+      const minPriceFloat = parseFloat(min_price);
+      if (!isNaN(minPriceFloat)) {
+        whereClause += ' AND price >= ?';
+        queryParams.push(minPriceFloat);
+      }
     }
 
+    if (max_price !== null && max_price !== undefined) {
+      const maxPriceFloat = parseFloat(max_price);
+      if (!isNaN(maxPriceFloat)) {
+        whereClause += ' AND price <= ?';
+        queryParams.push(maxPriceFloat);
+      }
+    }
+
+    // Bedroom filters
+    if (min_bedrooms !== null && min_bedrooms !== undefined) {
+      const minBed = parseInt(min_bedrooms);
+      if (!isNaN(minBed)) {
+        whereClause += ' AND bedrooms >= ?';
+        queryParams.push(minBed);
+      }
+    }
+
+    if (max_bedrooms !== null && max_bedrooms !== undefined) {
+      const maxBed = parseInt(max_bedrooms);
+      if (!isNaN(maxBed)) {
+        whereClause += ' AND bedrooms <= ?';
+        queryParams.push(maxBed);
+      }
+    }
+
+    // Bathroom filters
+    if (min_bathrooms !== null && min_bathrooms !== undefined) {
+      const minBath = parseInt(min_bathrooms);
+      if (!isNaN(minBath)) {
+        whereClause += ' AND bathrooms >= ?';
+        queryParams.push(minBath);
+      }
+    }
+
+    if (max_bathrooms !== null && max_bathrooms !== undefined) {
+      const maxBath = parseInt(max_bathrooms);
+      if (!isNaN(maxBath)) {
+        whereClause += ' AND bathrooms <= ?';
+        queryParams.push(maxBath);
+      }
+    }
+
+    // Location filter
     if (location) {
-      whereConditions.push('address LIKE ?');
+      whereClause += ' AND address LIKE ?';
       queryParams.push(`%${location}%`);
     }
 
-    const whereClause = whereConditions.join(' AND ');
+    // Availability date filters
+    if (available_from) {
+      whereClause += ' AND (available_from IS NULL OR available_from <= ?)';
+      queryParams.push(available_from);
+    }
 
-    const validSortColumns = ['created_at', 'price', 'views_count', 'property_type'];
-    const sortColumn = validSortColumns.includes(sort_by) ? sort_by : 'created_at';
+    if (available_to) {
+      whereClause += ' AND (available_to IS NULL OR available_to >= ?)';
+      queryParams.push(available_to);
+    }
 
-    const countQuery = `SELECT COUNT(*) as total FROM all_properties WHERE ${whereClause}`;
+    // Amenities filter
+    if (amenities) {
+      const amenitiesList = amenities.split(',');
+      for (const amenity of amenitiesList) {
+        whereClause += ' AND JSON_EXTRACT(amenities, ?) IS NOT NULL';
+        queryParams.push(`$.${amenity.trim()}`);
+      }
+    }
+
+    // Facilities filter
+    if (facilities) {
+      const facilitiesList = facilities.split(',');
+      for (const facility of facilitiesList) {
+        whereClause += ' AND JSON_EXTRACT(facilities, ?) IS NOT NULL';
+        queryParams.push(`$.${facility.trim()}`);
+      }
+    }
+
+    // Get total count for pagination
+    const countQuery = `SELECT COUNT(*) as total FROM all_properties ${whereClause}`;
     const countResult = await query(countQuery, queryParams);
     const totalProperties = countResult[0].total;
 
+    // Sorting
+    const allowedSortFields = ['created_at', 'updated_at', 'price', 'views_count', 'property_type', 'unit_type'];
+    const sortColumn = allowedSortFields.includes(sort_by) ? sort_by : 'created_at';
+    const sortDirection = sort_order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+    // Main query with sorting and pagination
     const propertiesQuery = `
       SELECT * FROM all_properties 
-      WHERE ${whereClause}
-      ORDER BY ${sortColumn} ${sort_order}
+      ${whereClause}
+      ORDER BY ${sortColumn} ${sortDirection}
       LIMIT ? OFFSET ?
     `;
 
-    const properties = await query(propertiesQuery, [...queryParams, limit, offset]);
+    queryParams.push(limit, offset);
+    const properties = await query(propertiesQuery, queryParams);
 
-    const processedProperties = properties.map(property => ({
-      ...property,
-      price: parseFloat(property.price),
-      amenities: safeJsonParse(property.amenities),
-      facilities: safeJsonParse(property.facilities),
-      images: safeJsonParse(property.images)
-    }));
+    const processedProperties = properties.map(processPropertyData);
 
     res.json({
       properties: processedProperties,
@@ -158,11 +241,20 @@ router.get('/public', async (req, res) => {
       filters: {
         search,
         property_type,
-        min_price,
-        max_price,
+        unit_type,
+        min_price: min_price ? parseFloat(min_price) : null,
+        max_price: max_price ? parseFloat(max_price) : null,
+        min_bedrooms: min_bedrooms ? parseInt(min_bedrooms) : null,
+        max_bedrooms: max_bedrooms ? parseInt(max_bedrooms) : null,
+        min_bathrooms: min_bathrooms ? parseInt(min_bathrooms) : null,
+        max_bathrooms: max_bathrooms ? parseInt(max_bathrooms) : null,
+        amenities,
+        facilities,
         location,
-        sort_by: sortColumn,
-        sort_order: sort_order.toLowerCase()
+        available_from,
+        available_to,
+        sort_by,
+        sort_order
       }
     });
 
@@ -175,7 +267,11 @@ router.get('/public', async (req, res) => {
   }
 });
 
-router.get('/public/:id', async (req, res) => {
+/**
+ * GET /api/properties/public/:id
+ * Get a single public property by ID
+ */
+router.get('/public/:id', optionalAuth, async (req, res) => {
   const propertyId = req.params.id;
 
   if (!propertyId || isNaN(propertyId)) {
@@ -199,13 +295,29 @@ router.get('/public/:id', async (req, res) => {
     }
 
     const property = properties[0];
-    const processedProperty = {
-      ...property,
-      price: parseFloat(property.price),
-      amenities: safeJsonParse(property.amenities),
-      facilities: safeJsonParse(property.facilities),
-      images: safeJsonParse(property.images)
-    };
+    const processedProperty = processPropertyData(property);
+
+    // Increment views count
+    try {
+      await query(
+        'UPDATE all_properties SET views_count = COALESCE(views_count, 0) + 1 WHERE id = ?',
+        [propertyId]
+      );
+    } catch (viewError) {
+      console.error('Error updating views count:', viewError);
+    }
+
+    // Record view if user is logged in
+    if (req.user) {
+      try {
+        await query(
+          'INSERT INTO user_interactions (user_id, property_id, interaction_type, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())',
+          [req.user.id, propertyId, 'view']
+        );
+      } catch (interactionError) {
+        console.error('Error recording user interaction:', interactionError);
+      }
+    }
 
     res.json(processedProperty);
 
@@ -218,85 +330,302 @@ router.get('/public/:id', async (req, res) => {
   }
 });
 
-router.get('/owner/mine', auth, async (req, res) => {
-  const userId = req.user.id;
-  
+/**
+ * GET /api/properties/types
+ * Get available property types
+ */
+router.get('/types', async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
-    const offset = (page - 1) * limit;
+    const typesQuery = 'SELECT DISTINCT property_type FROM all_properties WHERE approval_status = "approved" AND is_active = 1 ORDER BY property_type';
+    const types = await query(typesQuery);
     
-    const search = req.query.search || '';
-    const status = req.query.status || '';
-    const approval_status = req.query.approval_status || '';
-    const sort_by = req.query.sort_by || 'created_at';
-    const sort_order = req.query.sort_order === 'asc' ? 'ASC' : 'DESC';
+    const propertyTypes = types.map(row => row.property_type);
+    
+    res.json(propertyTypes);
+  } catch (error) {
+    console.error('Error fetching property types:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch property types. Please try again.'
+    });
+  }
+});
 
-    let whereConditions = ['user_id = ?'];
+/**
+ * GET /api/properties/unit-types
+ * Get available unit types
+ */
+router.get('/unit-types', async (req, res) => {
+  try {
+    const typesQuery = 'SELECT DISTINCT unit_type FROM all_properties WHERE approval_status = "approved" AND is_active = 1 ORDER BY unit_type';
+    const types = await query(typesQuery);
+    
+    const unitTypes = types.map(row => row.unit_type);
+    
+    res.json(unitTypes);
+  } catch (error) {
+    console.error('Error fetching unit types:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch unit types. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/properties/search
+ * Advanced property search
+ */
+router.get('/search', async (req, res) => {
+  try {
+    const {
+      q,
+      category,
+      location,
+      min_price,
+      max_price,
+      bedrooms,
+      bathrooms,
+      amenities,
+      sort = 'relevance',
+      page = 1,
+      limit = 20
+    } = req.query;
+
+    let searchQuery = `
+      SELECT *, 
+        MATCH(property_type, unit_type, address, description) AGAINST(? IN NATURAL LANGUAGE MODE) as relevance_score
+      FROM all_properties 
+      WHERE approval_status = 'approved' AND is_active = 1
+    `;
+    
+    let queryParams = [q || ''];
+
+    if (q) {
+      searchQuery += ' AND MATCH(property_type, unit_type, address, description) AGAINST(? IN NATURAL LANGUAGE MODE)';
+      queryParams.push(q);
+    }
+
+    if (category) {
+      searchQuery += ' AND property_type = ?';
+      queryParams.push(category);
+    }
+
+    if (location) {
+      searchQuery += ' AND address LIKE ?';
+      queryParams.push(`%${location}%`);
+    }
+
+    if (min_price) {
+      searchQuery += ' AND price >= ?';
+      queryParams.push(parseFloat(min_price));
+    }
+
+    if (max_price) {
+      searchQuery += ' AND price <= ?';
+      queryParams.push(parseFloat(max_price));
+    }
+
+    if (bedrooms) {
+      searchQuery += ' AND bedrooms = ?';
+      queryParams.push(parseInt(bedrooms));
+    }
+
+    if (bathrooms) {
+      searchQuery += ' AND bathrooms = ?';
+      queryParams.push(parseInt(bathrooms));
+    }
+
+    // Sort options
+    if (sort === 'price_low') {
+      searchQuery += ' ORDER BY price ASC';
+    } else if (sort === 'price_high') {
+      searchQuery += ' ORDER BY price DESC';
+    } else if (sort === 'newest') {
+      searchQuery += ' ORDER BY created_at DESC';
+    } else if (sort === 'popular') {
+      searchQuery += ' ORDER BY views_count DESC';
+    } else {
+      searchQuery += ' ORDER BY relevance_score DESC, created_at DESC';
+    }
+
+    // Pagination
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    searchQuery += ' LIMIT ? OFFSET ?';
+    queryParams.push(parseInt(limit), offset);
+
+    const properties = await query(searchQuery, queryParams);
+    const processedProperties = properties.map(processPropertyData);
+
+    res.json({
+      properties: processedProperties,
+      total: properties.length,
+      page: parseInt(page),
+      limit: parseInt(limit)
+    });
+
+  } catch (error) {
+    console.error('Error in property search:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to search properties. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/properties/similar/:id
+ * Get similar properties
+ */
+router.get('/similar/:id', async (req, res) => {
+  const propertyId = req.params.id;
+  const limit = Math.min(parseInt(req.query.limit) || 6, 20);
+
+  try {
+    // Get the base property
+    const baseProperty = await query(
+      'SELECT * FROM all_properties WHERE id = ?',
+      [propertyId]
+    );
+
+    if (baseProperty.length === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'Base property not found'
+      });
+    }
+
+    const base = baseProperty[0];
+
+    // Find similar properties
+    const similarQuery = `
+      SELECT *, 
+        (
+          CASE WHEN property_type = ? THEN 3 ELSE 0 END +
+          CASE WHEN unit_type = ? THEN 2 ELSE 0 END +
+          CASE WHEN ABS(price - ?) < ? * 0.2 THEN 2 ELSE 0 END +
+          CASE WHEN address LIKE ? THEN 1 ELSE 0 END
+        ) as similarity_score
+      FROM all_properties 
+      WHERE id != ? 
+        AND approval_status = 'approved' 
+        AND is_active = 1
+      HAVING similarity_score > 0
+      ORDER BY similarity_score DESC, created_at DESC
+      LIMIT ?
+    `;
+
+    const locationPattern = `%${base.address.split(',')[0]}%`;
+    const similar = await query(similarQuery, [
+      base.property_type,
+      base.unit_type,
+      base.price,
+      base.price,
+      locationPattern,
+      propertyId,
+      limit
+    ]);
+
+    const processedSimilar = similar.map(processPropertyData);
+
+    res.json(processedSimilar);
+
+  } catch (error) {
+    console.error('Error fetching similar properties:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch similar properties. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/properties/featured
+ * Get featured properties
+ */
+router.get('/featured', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 8, 20);
+
+    const featuredQuery = `
+      SELECT * FROM all_properties 
+      WHERE approval_status = 'approved' 
+        AND is_active = 1
+        AND (views_count > 10 OR created_at > DATE_SUB(NOW(), INTERVAL 30 DAY))
+      ORDER BY views_count DESC, created_at DESC
+      LIMIT ?
+    `;
+
+    const featured = await query(featuredQuery, [limit]);
+    const processedFeatured = featured.map(processPropertyData);
+
+    res.json(processedFeatured);
+
+  } catch (error) {
+    console.error('Error fetching featured properties:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch featured properties. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/properties/owner/mine
+ * Get owner's properties
+ */
+router.get('/owner/mine', auth, requirePropertyOwner, async (req, res) => {
+  const userId = req.user.id;
+  const page = parseInt(req.query.page) || 1;
+  const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+  const offset = (page - 1) * limit;
+  const { search, status, approval_status, sort_by = 'created_at', sort_order = 'DESC' } = req.query;
+
+  try {
+    let whereClause = 'WHERE ap.user_id = ?';
     let queryParams = [userId];
 
-    if (search) {
-      whereConditions.push('(property_type LIKE ? OR unit_type LIKE ? OR address LIKE ? OR description LIKE ?)');
-      const searchPattern = `%${search}%`;
-      queryParams.push(searchPattern, searchPattern, searchPattern, searchPattern);
+    // Status filter
+    if (status && status !== 'all') {
+      whereClause += ' AND ap.is_active = ?';
+      queryParams.push(status === 'active' ? 1 : 0);
     }
 
-    if (status) {
-      if (status === 'active') {
-        whereConditions.push('is_active = ?');
-        queryParams.push(1);
-      } else if (status === 'inactive') {
-        whereConditions.push('is_active = ?');
-        queryParams.push(0);
-      }
-    }
-
-    if (approval_status) {
-      whereConditions.push('approval_status = ?');
+    // Approval status filter
+    if (approval_status && approval_status !== 'all') {
+      whereClause += ' AND ap.approval_status = ?';
       queryParams.push(approval_status);
     }
 
-    const whereClause = whereConditions.join(' AND ');
+    // Search filter
+    if (search) {
+      whereClause += ' AND (ap.address LIKE ? OR ap.property_type LIKE ? OR ap.unit_type LIKE ? OR ap.description LIKE ?)';
+      const searchTerm = `%${search}%`;
+      queryParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
+    }
 
-    const validSortColumns = ['created_at', 'updated_at', 'price', 'views_count', 'property_type', 'approval_status'];
-    const sortColumn = validSortColumns.includes(sort_by) ? sort_by : 'created_at';
-
-    const countQuery = `SELECT COUNT(*) as total FROM all_properties WHERE ${whereClause}`;
+    // Get total count
+    const countQuery = `SELECT COUNT(*) as total FROM all_properties ap ${whereClause}`;
     const countResult = await query(countQuery, queryParams);
     const totalProperties = countResult[0].total;
 
+    // Sorting
+    const allowedSortFields = ['created_at', 'updated_at', 'price', 'views_count', 'approval_status'];
+    const sortColumn = allowedSortFields.includes(sort_by) ? `ap.${sort_by}` : 'ap.created_at';
+    const sortDirection = sort_order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+    // Main query
     const propertiesQuery = `
-      SELECT * FROM all_properties 
-      WHERE ${whereClause}
-      ORDER BY ${sortColumn} ${sort_order}
+      SELECT ap.* FROM all_properties ap
+      ${whereClause}
+      ORDER BY ${sortColumn} ${sortDirection}
       LIMIT ? OFFSET ?
     `;
 
-    const properties = await query(propertiesQuery, [...queryParams, limit, offset]);
+    queryParams.push(limit, offset);
+    const properties = await query(propertiesQuery, queryParams);
 
-    const processedProperties = properties.map(property => ({
-      ...property,
-      price: parseFloat(property.price),
-      amenities: safeJsonParse(property.amenities),
-      facilities: safeJsonParse(property.facilities),
-      images: safeJsonParse(property.images)
-    }));
-
-    const statsQuery = `
-      SELECT 
-        COUNT(*) as total_count,
-        SUM(CASE WHEN approval_status = 'approved' THEN 1 ELSE 0 END) as approved_count,
-        SUM(CASE WHEN approval_status = 'pending' THEN 1 ELSE 0 END) as pending_count,
-        SUM(CASE WHEN approval_status = 'rejected' THEN 1 ELSE 0 END) as rejected_count,
-        SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active_count,
-        SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) as inactive_count,
-        SUM(COALESCE(views_count, 0)) as total_views
-      FROM all_properties 
-      WHERE user_id = ?
-    `;
-
-    const statsResult = await query(statsQuery, [userId]);
-    const stats = statsResult[0];
+    const processedProperties = properties.map(processPropertyData);
 
     res.json({
       properties: processedProperties,
@@ -308,21 +637,12 @@ router.get('/owner/mine', auth, async (req, res) => {
         hasNext: page < Math.ceil(totalProperties / limit),
         hasPrevious: page > 1
       },
-      stats: {
-        total: parseInt(stats.total_count),
-        approved: parseInt(stats.approved_count),
-        pending: parseInt(stats.pending_count),
-        rejected: parseInt(stats.rejected_count),
-        active: parseInt(stats.active_count),
-        inactive: parseInt(stats.inactive_count),
-        total_views: parseInt(stats.total_views)
-      },
       filters: {
         search,
         status,
         approval_status,
-        sort_by: sortColumn,
-        sort_order: sort_order.toLowerCase()
+        sort_by,
+        sort_order
       }
     });
 
@@ -330,108 +650,290 @@ router.get('/owner/mine', auth, async (req, res) => {
     console.error('Error fetching owner properties:', error);
     res.status(500).json({
       error: 'Database error',
-      message: 'Unable to fetch your properties. Please try again.'
+      message: 'Unable to fetch properties. Please try again.'
     });
   }
 });
 
-router.post('/', auth, async (req, res) => {
+/**
+ * GET /api/properties/owner/statistics
+ * Get owner's property statistics
+ */
+router.get('/owner/statistics', auth, requirePropertyOwner, async (req, res) => {
   const userId = req.user.id;
-  const propertyData = req.body;
 
-  console.log('Received property data:', propertyData);
+  try {
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total_properties,
+        COUNT(CASE WHEN approval_status = 'approved' THEN 1 END) as approved_properties,
+        COUNT(CASE WHEN approval_status = 'pending' THEN 1 END) as pending_properties,
+        COUNT(CASE WHEN approval_status = 'rejected' THEN 1 END) as rejected_properties,
+        COUNT(CASE WHEN is_active = 1 THEN 1 END) as active_properties,
+        SUM(views_count) as total_views,
+        AVG(price) as average_price,
+        MIN(price) as min_price,
+        MAX(price) as max_price
+      FROM all_properties 
+      WHERE user_id = ?
+    `;
 
-  if (!propertyData || typeof propertyData !== 'object') {
-    return res.status(400).json({
-      error: 'Invalid data',
-      message: 'Property data is required'
+    const stats = await query(statsQuery, [userId]);
+
+    const bookingStatsQuery = `
+      SELECT 
+        COUNT(br.id) as total_bookings,
+        COUNT(CASE WHEN br.status = 'pending' THEN 1 END) as pending_bookings,
+        COUNT(CASE WHEN br.status = 'confirmed' THEN 1 END) as confirmed_bookings,
+        COUNT(CASE WHEN br.status = 'cancelled' THEN 1 END) as cancelled_bookings,
+        COALESCE(SUM(br.total_amount), 0) as total_revenue,
+        COALESCE(SUM(br.advance_amount), 0) as advance_collected
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      WHERE ap.user_id = ?
+    `;
+
+    const bookingStats = await query(bookingStatsQuery, [userId]);
+
+    res.json({
+      property_stats: stats[0],
+      booking_stats: bookingStats[0],
+      last_updated: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error fetching owner statistics:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch statistics. Please try again.'
     });
   }
+});
 
-  const validationErrors = validatePropertyData(propertyData);
-  if (validationErrors.length > 0) {
+/**
+ * GET /api/properties/:id/stats
+ * Get specific property statistics
+ */
+router.get('/:id/stats', auth, requirePropertyOwnership, async (req, res) => {
+  const propertyId = req.params.id;
+
+  try {
+    // Get property details
+    const propertyQuery = 'SELECT * FROM all_properties WHERE id = ? AND user_id = ?';
+    const properties = await query(propertyQuery, [propertyId, req.user.id]);
+
+    if (properties.length === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'Property not found or you do not have access to it'
+      });
+    }
+
+    // Get booking statistics
+    const bookingStatsQuery = `
+      SELECT 
+        COUNT(*) as total_bookings,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_bookings,
+        COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as confirmed_bookings,
+        COUNT(CASE WHEN status = 'cancelled' THEN 1 END) as cancelled_bookings,
+        COALESCE(SUM(total_amount), 0) as total_revenue,
+        COALESCE(SUM(advance_amount), 0) as advance_collected,
+        COALESCE(AVG(total_amount), 0) as average_booking_value,
+        COALESCE(AVG(advance_amount), 0) as average_advance_amount
+      FROM booking_requests 
+      WHERE property_id = ?
+    `;
+
+    // Get interaction statistics
+    const interactionStatsQuery = `
+      SELECT 
+        COUNT(CASE WHEN interaction_type = 'view' THEN 1 END) as total_views,
+        COUNT(CASE WHEN interaction_type = 'favorite' THEN 1 END) as total_favorites,
+        COUNT(CASE WHEN interaction_type = 'rating' THEN 1 END) as total_ratings,
+        COALESCE(AVG(CASE WHEN interaction_type = 'rating' THEN rating_score END), 0) as average_rating
+      FROM user_interactions 
+      WHERE property_id = ?
+    `;
+
+    const bookingStats = await query(bookingStatsQuery, [propertyId]);
+    const interactionStats = await query(interactionStatsQuery, [propertyId]);
+    
+    const property = properties[0];
+    const booking = bookingStats[0];
+    const interaction = interactionStats[0];
+
+    res.json({
+      property: {
+        id: property.id,
+        property_type: property.property_type,
+        unit_type: property.unit_type,
+        address: property.address,
+        price: parseFloat(property.price),
+        is_active: property.is_active,
+        approval_status: property.approval_status,
+        views_count: property.views_count || 0,
+        created_at: property.created_at
+      },
+      bookings: {
+        total: parseInt(booking.total_bookings),
+        pending: parseInt(booking.pending_bookings),
+        confirmed: parseInt(booking.confirmed_bookings),
+        cancelled: parseInt(booking.cancelled_bookings)
+      },
+      revenue: {
+        total: parseFloat(booking.total_revenue),
+        advance_collected: parseFloat(booking.advance_collected),
+        average_booking_value: parseFloat(booking.average_booking_value),
+        average_advance_amount: parseFloat(booking.average_advance_amount)
+      },
+      interactions: {
+        total_views: parseInt(interaction.total_views),
+        total_favorites: parseInt(interaction.total_favorites),
+        total_ratings: parseInt(interaction.total_ratings),
+        average_rating: parseFloat(interaction.average_rating)
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching property stats:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch property statistics. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/properties/:id
+ * Get single property for owner
+ */
+router.get('/:id', auth, requirePropertyOwnership, async (req, res) => {
+  const propertyId = req.params.id;
+
+  if (!propertyId || isNaN(propertyId)) {
     return res.status(400).json({
-      error: 'Validation failed',
-      message: validationErrors.join(', ')
+      error: 'Invalid property ID',
+      message: 'Property ID must be a valid number'
     });
   }
 
   try {
-    const price = parseFloat(propertyData.price);
-    const bedrooms = propertyData.facilities?.Bedroom || propertyData.facilities?.Bedrooms ? 
-      parseInt(propertyData.facilities.Bedroom || propertyData.facilities.Bedrooms) : 0;
-    const bathrooms = propertyData.facilities?.Bathroom || propertyData.facilities?.Bathrooms ? 
-      parseInt(propertyData.facilities.Bathroom || propertyData.facilities.Bathrooms) : 0;
+    const properties = await query(
+      'SELECT * FROM all_properties WHERE id = ? AND user_id = ?',
+      [propertyId, req.user.id]
+    );
 
-    const normalizedFacilities = { ...propertyData.facilities };
-    if (normalizedFacilities.Bedrooms !== undefined) {
-      normalizedFacilities.Bedroom = normalizedFacilities.Bedrooms;
-      delete normalizedFacilities.Bedrooms;
-    }
-    if (normalizedFacilities.Bathrooms !== undefined) {
-      normalizedFacilities.Bathroom = normalizedFacilities.Bathrooms;
-      delete normalizedFacilities.Bathrooms;
+    if (properties.length === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'Property not found or you do not have access to it'
+      });
     }
 
-    const availableFromDate = formatDateForMySQL(propertyData.availableFrom);
-    const availableToDate = formatDateForMySQL(propertyData.availableTo);
+    const property = properties[0];
+    const processedProperty = processPropertyData(property);
 
-    const transactionQueries = [
-      {
-        sql: `INSERT INTO all_properties (
-          user_id, property_type, unit_type, address, price, amenities, facilities, 
-          images, description, bedrooms, bathrooms, available_from, available_to, 
-          is_active, approval_status, views_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', 0)`,
-        params: [
-          userId,
-          propertyData.property_type,
-          propertyData.unit_type,
-          propertyData.address,
-          price,
-          JSON.stringify(propertyData.amenities),
-          JSON.stringify(normalizedFacilities),
-          JSON.stringify(propertyData.images || []),
-          propertyData.description,
-          bedrooms,
-          bathrooms,
-          availableFromDate,
-          availableToDate
-        ]
-      },
-      {
-        sql: `INSERT INTO property_details (
-          user_id, property_type, unit_type, amenities, facilities, other_facility,
-          roommates, rules, contract_policy, address, available_from, available_to,
-          price_range, bills_inclusive, approval_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
-        params: [
-          userId,
-          propertyData.property_type,
-          propertyData.unit_type,
-          JSON.stringify(propertyData.amenities),
-          JSON.stringify(normalizedFacilities),
-          propertyData.otherFacility || propertyData.other_facility || '',
-          JSON.stringify(propertyData.roommates || []),
-          JSON.stringify(propertyData.rules || []),
-          propertyData.contractPolicy,
-          propertyData.address,
-          availableFromDate,
-          availableToDate,
-          JSON.stringify({ min: price, max: price }),
-          JSON.stringify(propertyData.billsInclusive || [])
-        ]
-      }
-    ];
+    res.json(processedProperty);
 
-    const results = await executeTransaction(transactionQueries);
-    const propertyId = results[0].insertId;
-
-    res.status(201).json({
-      message: 'Property created successfully',
-      property_id: propertyId,
-      approval_status: 'pending'
+  } catch (error) {
+    console.error('Error fetching property details:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch property details. Please try again.'
     });
+  }
+});
+
+/**
+ * POST /api/properties
+ * Create a new property
+ */
+router.post('/', auth, requirePropertyOwner, async (req, res) => {
+  const propertyData = req.body;
+
+  try {
+    // Validate required fields
+    const requiredFields = ['property_type', 'unit_type', 'address', 'description', 'price'];
+    for (const field of requiredFields) {
+      if (!propertyData[field]) {
+        return res.status(400).json({
+          error: 'Validation error',
+          message: `${field} is required`
+        });
+      }
+    }
+
+    // Map frontend camelCase to backend snake_case
+    const mappedData = {
+      property_type: propertyData.property_type,
+      unit_type: propertyData.unit_type,
+      address: propertyData.address,
+      description: propertyData.description,
+      price: parseFloat(propertyData.price),
+      bedrooms: parseInt(propertyData.bedrooms) || 0,
+      bathrooms: parseInt(propertyData.bathrooms) || 0,
+      available_from: propertyData.availableFrom ? dayjs(propertyData.availableFrom).format('YYYY-MM-DD') : null,
+      available_to: propertyData.availableTo ? dayjs(propertyData.availableTo).format('YYYY-MM-DD') : null,
+      contract_policy: propertyData.contractPolicy || '',
+      amenities: propertyData.amenities || {},
+      facilities: propertyData.facilities || {},
+      images: propertyData.images || [],
+      rules: propertyData.rules || [],
+      roommates: propertyData.roommates || [],
+      bills_inclusive: propertyData.billsInclusive || []
+    };
+
+    // Validate price
+    if (isNaN(mappedData.price) || mappedData.price <= 0) {
+      return res.status(400).json({
+        error: 'Validation error',
+        message: 'Price must be a valid positive number'
+      });
+    }
+
+    const insertQuery = `
+      INSERT INTO all_properties (
+        user_id, property_type, unit_type, address, description, price,
+        bedrooms, bathrooms, available_from, available_to, contract_policy, 
+        amenities, facilities, images, rules, roommates, bills_inclusive,
+        is_active, approval_status, views_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+    `;
+
+    const result = await query(insertQuery, [
+      req.user.id,
+      mappedData.property_type,
+      mappedData.unit_type,
+      mappedData.address,
+      mappedData.description,
+      mappedData.price,
+      mappedData.bedrooms,
+      mappedData.bathrooms,
+      mappedData.available_from,
+      mappedData.available_to,
+      mappedData.contract_policy,
+      JSON.stringify(mappedData.amenities),
+      JSON.stringify(mappedData.facilities),
+      JSON.stringify(mappedData.images),
+      JSON.stringify(mappedData.rules),
+      JSON.stringify(mappedData.roommates),
+      JSON.stringify(mappedData.bills_inclusive),
+      1, // is_active
+      'pending', // approval_status
+      0 // views_count
+    ]);
+
+    const newPropertyId = result.insertId;
+
+    // Get the created property
+    const createdProperty = await query(
+      'SELECT * FROM all_properties WHERE id = ?',
+      [newPropertyId]
+    );
+
+    const processedProperty = processPropertyData(createdProperty[0]);
+
+    res.status(201).json(processedProperty);
 
   } catch (error) {
     console.error('Error creating property:', error);
@@ -442,11 +944,13 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-router.put('/:id', auth, async (req, res) => {
+/**
+ * PUT /api/properties/:id
+ * Update a property
+ */
+router.put('/:id', auth, requirePropertyOwnership, async (req, res) => {
   const propertyId = req.params.id;
-  const userId = req.user.id;
-  const userRole = req.user.role;
-  const updateData = req.body;
+  const propertyData = req.body;
 
   if (!propertyId || isNaN(propertyId)) {
     return res.status(400).json({
@@ -455,104 +959,86 @@ router.put('/:id', auth, async (req, res) => {
     });
   }
 
-  if (!updateData || typeof updateData !== 'object') {
-    return res.status(400).json({
-      error: 'Invalid data',
-      message: 'Update data is required'
-    });
-  }
-
   try {
-    let whereClause = 'id = ?';
-    let queryParams = [propertyId];
+    // Map frontend camelCase to backend snake_case
+    const mappedData = {
+      property_type: propertyData.property_type,
+      unit_type: propertyData.unit_type,
+      address: propertyData.address,
+      description: propertyData.description,
+      price: parseFloat(propertyData.price),
+      bedrooms: parseInt(propertyData.bedrooms) || 0,
+      bathrooms: parseInt(propertyData.bathrooms) || 0,
+      available_from: propertyData.available_from ? dayjs(propertyData.available_from).format('YYYY-MM-DD') : null,
+      available_to: propertyData.available_to ? dayjs(propertyData.available_to).format('YYYY-MM-DD') : null,
+      contract_policy: propertyData.contract_policy || propertyData.contractPolicy,
+      amenities: propertyData.amenities || {},
+      facilities: propertyData.facilities || {},
+      images: propertyData.images || [],
+      rules: propertyData.rules || [],
+      roommates: propertyData.roommates || [],
+      bills_inclusive: propertyData.bills_inclusive || propertyData.billsInclusive || []
+    };
 
-    if (userRole !== 'admin') {
-      whereClause += ' AND user_id = ?';
-      queryParams.push(userId);
-    }
+    const updateQuery = `
+      UPDATE all_properties SET 
+        property_type = ?, 
+        unit_type = ?, 
+        address = ?, 
+        description = ?, 
+        price = ?, 
+        bedrooms = ?,
+        bathrooms = ?,
+        available_from = ?, 
+        available_to = ?,
+        contract_policy = ?, 
+        amenities = ?, 
+        facilities = ?, 
+        images = ?,
+        rules = ?,
+        roommates = ?,
+        bills_inclusive = ?,
+        updated_at = NOW()
+      WHERE id = ? AND user_id = ?
+    `;
 
-    const existingProperty = await query(
-      `SELECT * FROM all_properties WHERE ${whereClause}`,
-      queryParams
-    );
+    const result = await query(updateQuery, [
+      mappedData.property_type,
+      mappedData.unit_type,
+      mappedData.address,
+      mappedData.description,
+      mappedData.price,
+      mappedData.bedrooms,
+      mappedData.bathrooms,
+      mappedData.available_from,
+      mappedData.available_to,
+      mappedData.contract_policy,
+      JSON.stringify(mappedData.amenities),
+      JSON.stringify(mappedData.facilities),
+      JSON.stringify(mappedData.images),
+      JSON.stringify(mappedData.rules),
+      JSON.stringify(mappedData.roommates),
+      JSON.stringify(mappedData.bills_inclusive),
+      propertyId,
+      req.user.id
+    ]);
 
-    if (existingProperty.length === 0) {
+    if (result.affectedRows === 0) {
       return res.status(404).json({
-        error: 'Property not found or access denied'
+        error: 'Property not found',
+        message: 'Property not found or you do not have permission to update it'
       });
     }
 
-    const normalizedFacilities = { ...updateData.facilities };
-    if (normalizedFacilities?.Bedrooms !== undefined) {
-      normalizedFacilities.Bedroom = normalizedFacilities.Bedrooms;
-      delete normalizedFacilities.Bedrooms;
-    }
-    if (normalizedFacilities?.Bathrooms !== undefined) {
-      normalizedFacilities.Bathroom = normalizedFacilities.Bathrooms;
-      delete normalizedFacilities.Bathrooms;
-    }
+    // Get updated property data
+    const updatedProperty = await query(
+      'SELECT * FROM all_properties WHERE id = ? AND user_id = ?',
+      [propertyId, req.user.id]
+    );
 
-    const bedrooms = normalizedFacilities?.Bedroom ? parseInt(normalizedFacilities.Bedroom) : 0;
-    const bathrooms = normalizedFacilities?.Bathroom ? parseInt(normalizedFacilities.Bathroom) : 0;
+    const processedProperty = processPropertyData(updatedProperty[0]);
 
-    const availableFromDate = formatDateForMySQL(updateData.available_from || updateData.availableFrom);
-    const availableToDate = formatDateForMySQL(updateData.available_to || updateData.availableTo);
-
-    const transactionQueries = [
-      {
-        sql: `UPDATE all_properties 
-        SET property_type = ?, unit_type = ?, address = ?, price = ?, 
-            amenities = ?, facilities = ?, images = ?, description = ?, 
-            bedrooms = ?, bathrooms = ?, available_from = ?, available_to = ?
-        WHERE id = ? AND user_id = ?`,
-        params: [
-          updateData.property_type || updateData.propertyType,
-          updateData.unit_type || updateData.unitType,
-          updateData.address,
-          parseFloat(updateData.price),
-          JSON.stringify(updateData.amenities || {}),
-          JSON.stringify(normalizedFacilities || {}),
-          JSON.stringify(updateData.images || []),
-          updateData.description,
-          bedrooms,
-          bathrooms,
-          availableFromDate,
-          availableToDate,
-          propertyId,
-          userId
-        ]
-      },
-      {
-        sql: `UPDATE property_details 
-        SET property_type = ?, unit_type = ?, amenities = ?, facilities = ?, 
-            other_facility = ?, rules = ?, contract_policy = ?, address = ?, 
-            available_from = ?, available_to = ?, roommates = ?, 
-            bills_inclusive = ?
-        WHERE user_id = ?`,
-        params: [
-          updateData.property_type || updateData.propertyType,
-          updateData.unit_type || updateData.unitType,
-          JSON.stringify(updateData.amenities || {}),
-          JSON.stringify(normalizedFacilities || {}),
-          updateData.otherFacility || updateData.other_facility || '',
-          JSON.stringify(updateData.rules || []),
-          updateData.contract_policy || updateData.contractPolicy,
-          updateData.address,
-          availableFromDate,
-          availableToDate,
-          JSON.stringify(updateData.roommates || []),
-          JSON.stringify(updateData.bills_inclusive || updateData.billsInclusive || []),
-          userId
-        ]
-      }
-    ];
-
-    await executeTransaction(transactionQueries);
-
-    res.json({
-      message: 'Property updated successfully',
-      property_id: propertyId
-    });
+    res.json(processedProperty);
 
   } catch (error) {
     console.error('Error updating property:', error);
@@ -563,139 +1049,38 @@ router.put('/:id', auth, async (req, res) => {
   }
 });
 
-router.delete('/:id', auth, async (req, res) => {
+/**
+ * PATCH /api/properties/:id/status
+ * Toggle property active status
+ */
+router.patch('/:id/status', auth, requirePropertyOwnership, async (req, res) => {
   const propertyId = req.params.id;
-  const userId = req.user.id;
-  const userRole = req.user.role;
+  const { is_active } = req.body;
 
-  if (!propertyId || isNaN(propertyId)) {
+  if (typeof is_active !== 'boolean') {
     return res.status(400).json({
-      error: 'Invalid property ID',
-      message: 'Property ID must be a valid number'
+      error: 'Invalid status',
+      message: 'is_active must be a boolean value'
     });
   }
 
   try {
-    let whereClause = 'id = ?';
-    let queryParams = [propertyId];
-
-    if (userRole !== 'admin') {
-      whereClause += ' AND user_id = ?';
-      queryParams.push(userId);
-    }
-
-    const existingProperty = await query(
-      `SELECT id, user_id FROM all_properties WHERE ${whereClause}`,
-      queryParams
+    const result = await query(
+      'UPDATE all_properties SET is_active = ?, updated_at = NOW() WHERE id = ? AND user_id = ?',
+      [is_active, propertyId, req.user.id]
     );
 
-    if (existingProperty.length === 0) {
-      return res.status(404).json({
-        error: 'Property not found or access denied'
-      });
-    }
-
-    const property = existingProperty[0];
-
-    const transactionQueries = [
-      {
-        sql: 'DELETE FROM property_details WHERE user_id = ?',
-        params: [property.user_id]
-      },
-      {
-        sql: `DELETE FROM all_properties WHERE ${whereClause}`,
-        params: queryParams
-      }
-    ];
-
-    await executeTransaction(transactionQueries);
-
-    res.json({
-      message: 'Property deleted successfully',
-      property_id: propertyId
-    });
-
-  } catch (error) {
-    console.error('Error deleting property:', error);
-    res.status(500).json({
-      error: 'Database error',
-      message: 'Unable to delete property. Please try again.'
-    });
-  }
-});
-
-router.patch('/:id/status', auth, async (req, res) => {
-  const propertyId = req.params.id;
-  const userId = req.user.id;
-  const userRole = req.user.role;
-  const { is_active, approval_status } = req.body;
-
-  if (!propertyId || isNaN(propertyId)) {
-    return res.status(400).json({
-      error: 'Invalid property ID',
-      message: 'Property ID must be a valid number'
-    });
-  }
-
-  try {
-    const existingProperty = await query(
-      'SELECT id, user_id, approval_status FROM all_properties WHERE id = ?',
-      [propertyId]
-    );
-
-    if (existingProperty.length === 0) {
+    if (result.affectedRows === 0) {
       return res.status(404).json({
         error: 'Property not found',
-        message: 'The specified property could not be found'
+        message: 'Property not found or you do not have permission to update it'
       });
     }
-
-    const property = existingProperty[0];
-
-    if (userRole !== 'admin' && property.user_id !== userId) {
-      return res.status(403).json({
-        error: 'Access denied',
-        message: 'You can only modify your own properties'
-      });
-    }
-
-    const updates = {};
-    const allPropsSetParts = [];
-    const allPropsParams = [];
-
-    if (is_active !== undefined) {
-      updates.is_active = Boolean(is_active);
-      allPropsSetParts.push('is_active = ?');
-      allPropsParams.push(updates.is_active ? 1 : 0);
-    }
-
-    if (approval_status !== undefined && userRole === 'admin') {
-      const validStatuses = ['pending', 'approved', 'rejected'];
-      if (validStatuses.includes(approval_status)) {
-        updates.approval_status = approval_status;
-        allPropsSetParts.push('approval_status = ?');
-        allPropsParams.push(updates.approval_status);
-      }
-    }
-
-    if (allPropsSetParts.length === 0) {
-      return res.status(400).json({
-        error: 'No valid updates provided',
-        message: 'Please provide valid fields to update'
-      });
-    }
-
-    allPropsParams.push(propertyId);
-
-    await query(
-      `UPDATE all_properties SET ${allPropsSetParts.join(', ')} WHERE id = ?`,
-      allPropsParams
-    );
 
     res.json({
-      message: 'Property status updated successfully',
+      message: `Property ${is_active ? 'activated' : 'deactivated'} successfully`,
       property_id: parseInt(propertyId),
-      updates: updates
+      is_active: is_active
     });
 
   } catch (error) {
@@ -707,44 +1092,246 @@ router.patch('/:id/status', auth, async (req, res) => {
   }
 });
 
-router.post('/:id/details', auth, requirePropertyOwnership, async (req, res) => {
+/**
+ * POST /api/properties/:id/images
+ * Upload property images
+ */
+router.post('/:id/images', auth, requirePropertyOwnership, upload.array('images', 10), async (req, res) => {
   const propertyId = req.params.id;
-  const userId = req.user.id;
-  const detailsData = req.body;
+
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        error: 'No images provided',
+        message: 'At least one image file is required'
+      });
+    }
+
+    // Get current property
+    const property = await query(
+      'SELECT images FROM all_properties WHERE id = ? AND user_id = ?',
+      [propertyId, req.user.id]
+    );
+
+    if (property.length === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'Property not found or you do not have access to it'
+      });
+    }
+
+    const currentImages = safeJsonParse(property[0].images);
+    const uploadedImages = [];
+
+    // Process uploaded files (This would integrate with your image upload service)
+    for (const file of req.files) {
+      const imageData = {
+        url: `/uploads/properties/${propertyId}/${file.filename}`,
+        filename: file.filename,
+        originalname: file.originalname,
+        size: file.size,
+        mimetype: file.mimetype
+      };
+      uploadedImages.push(imageData);
+    }
+
+    // Combine with existing images
+    const allImages = [...currentImages, ...uploadedImages];
+
+    // Update property with new images
+    await query(
+      'UPDATE all_properties SET images = ?, updated_at = NOW() WHERE id = ? AND user_id = ?',
+      [JSON.stringify(allImages), propertyId, req.user.id]
+    );
+
+    res.json({
+      message: 'Images uploaded successfully',
+      images: uploadedImages,
+      total_images: allImages.length
+    });
+
+  } catch (error) {
+    console.error('Error uploading property images:', error);
+    res.status(500).json({
+      error: 'Upload error',
+      message: 'Unable to upload images. Please try again.'
+    });
+  }
+});
+
+/**
+ * DELETE /api/properties/:id/images/:imageId
+ * Delete a property image
+ */
+router.delete('/:id/images/:imageId', auth, requirePropertyOwnership, async (req, res) => {
+  const { id: propertyId, imageId } = req.params;
+
+  try {
+    // Get current property
+    const property = await query(
+      'SELECT images FROM all_properties WHERE id = ? AND user_id = ?',
+      [propertyId, req.user.id]
+    );
+
+    if (property.length === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'Property not found or you do not have access to it'
+      });
+    }
+
+    const currentImages = safeJsonParse(property[0].images);
+    const imageIndex = parseInt(imageId);
+
+    if (imageIndex < 0 || imageIndex >= currentImages.length) {
+      return res.status(404).json({
+        error: 'Image not found',
+        message: 'Image index is invalid'
+      });
+    }
+
+    // Remove image from array
+    const updatedImages = currentImages.filter((_, index) => index !== imageIndex);
+
+    // Update property
+    await query(
+      'UPDATE all_properties SET images = ?, updated_at = NOW() WHERE id = ? AND user_id = ?',
+      [JSON.stringify(updatedImages), propertyId, req.user.id]
+    );
+
+    res.json({
+      message: 'Image deleted successfully',
+      remaining_images: updatedImages.length
+    });
+
+  } catch (error) {
+    console.error('Error deleting property image:', error);
+    res.status(500).json({
+      error: 'Delete error',
+      message: 'Unable to delete image. Please try again.'
+    });
+  }
+});
+
+/**
+ * POST /api/properties/:id/duplicate
+ * Duplicate a property
+ */
+router.post('/:id/duplicate', auth, requirePropertyOwnership, async (req, res) => {
+  const propertyId = req.params.id;
+
+  try {
+    // Get original property
+    const originalProperty = await query(
+      'SELECT * FROM all_properties WHERE id = ? AND user_id = ?',
+      [propertyId, req.user.id]
+    );
+
+    if (originalProperty.length === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'Property not found or you do not have access to it'
+      });
+    }
+
+    const original = originalProperty[0];
+
+    // Create duplicate
+    const insertQuery = `
+      INSERT INTO all_properties (
+        user_id, property_type, unit_type, address, description, price,
+        bedrooms, bathrooms, available_from, available_to, contract_policy,
+        amenities, facilities, images, rules, roommates, bills_inclusive,
+        is_active, approval_status, views_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+    `;
+
+    const result = await query(insertQuery, [
+      req.user.id,
+      original.property_type,
+      original.unit_type,
+      `${original.address} (Copy)`,
+      original.description,
+      original.price,
+      original.bedrooms,
+      original.bathrooms,
+      original.available_from,
+      original.available_to,
+      original.contract_policy,
+      original.amenities,
+      original.facilities,
+      '[]', // Clear images for duplicate
+      original.rules,
+      original.roommates,
+      original.bills_inclusive,
+      0, // Inactive by default
+      'pending',
+      0
+    ]);
+
+    const newPropertyId = result.insertId;
+
+    // Get duplicated property
+    const duplicatedProperty = await query(
+      'SELECT * FROM all_properties WHERE id = ?',
+      [newPropertyId]
+    );
+
+    const processedProperty = processPropertyData(duplicatedProperty[0]);
+
+    res.status(201).json(processedProperty);
+
+  } catch (error) {
+    console.error('Error duplicating property:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to duplicate property. Please try again.'
+    });
+  }
+});
+
+/**
+ * DELETE /api/properties/:id
+ * Delete a property
+ */
+router.delete('/:id', auth, requirePropertyOwnership, async (req, res) => {
+  const propertyId = req.params.id;
 
   try {
     const transactionQueries = [
       {
-        sql: 'DELETE FROM property_details WHERE user_id = ? AND property_id = ?',
-        params: [userId, propertyId]
+        sql: 'DELETE FROM user_interactions WHERE property_id = ?',
+        params: [propertyId]
+      },
+      {
+        sql: 'DELETE FROM booking_requests WHERE property_id = ?',
+        params: [propertyId]
+      },
+      {
+        sql: 'DELETE FROM all_properties WHERE id = ? AND user_id = ?',
+        params: [propertyId, req.user.id]
       }
     ];
 
-    if (detailsData && Object.keys(detailsData).length > 0) {
-      transactionQueries.push({
-        sql: `INSERT INTO property_details (
-          user_id, property_id, details_data
-        ) VALUES (?, ?, ?)`,
-        params: [
-          userId,
-          propertyId,
-          JSON.stringify(detailsData)
-        ]
+    const results = await executeTransaction(transactionQueries);
+
+    if (results[results.length - 1].affectedRows === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'Property not found or you do not have permission to delete it'
       });
     }
 
-    await executeTransaction(transactionQueries);
-
     res.json({
-      message: 'Property details updated successfully',
-      property_id: propertyId
+      message: 'Property deleted successfully',
+      property_id: parseInt(propertyId)
     });
 
   } catch (error) {
-    console.error('Error updating property details:', error);
+    console.error('Error deleting property:', error);
     res.status(500).json({
       error: 'Database error',
-      message: 'Unable to update property details. Please try again.'
+      message: 'Unable to delete property. Please try again.'
     });
   }
 });

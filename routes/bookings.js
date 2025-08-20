@@ -36,156 +36,114 @@ const safeJsonParse = (value) => {
  */
 router.post('/', auth, requireUser, async (req, res) => {
   const userId = req.user.id;
-  const bookingData = req.body;
+  const {
+    property_id, first_name, last_name, email, country_code = '+94', mobile_number,
+    birthdate, gender, nationality, occupation, field, destination, relocation_details,
+    check_in_date, check_out_date
+  } = req.body;
 
-  // Validate required fields
-  const requiredFields = [
-    'property_id', 'first_name', 'last_name', 'email', 'mobile_number'
-  ];
-
-  const missingFields = requiredFields.filter(field => !bookingData[field]);
-  if (missingFields.length > 0) {
+  if (!property_id || !first_name || !last_name || !email || !mobile_number || !check_in_date || !check_out_date) {
     return res.status(400).json({
       error: 'Missing required fields',
-      message: `The following fields are required: ${missingFields.join(', ')}`,
-      missing_fields: missingFields
+      message: 'Property ID, name, email, mobile number, and dates are required'
     });
   }
 
-  // Validate property_id
-  const propertyId = parseInt(bookingData.property_id);
-  if (isNaN(propertyId)) {
+  const checkInDate = new Date(check_in_date);
+  const checkOutDate = new Date(check_out_date);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  if (checkInDate < today) {
     return res.status(400).json({
-      error: 'Invalid property ID',
-      message: 'Property ID must be a valid number'
+      error: 'Invalid check-in date',
+      message: 'Check-in date cannot be in the past'
     });
   }
 
-  // Validate email format
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(bookingData.email)) {
+  if (checkOutDate <= checkInDate) {
     return res.status(400).json({
-      error: 'Invalid email',
-      message: 'Please provide a valid email address'
-    });
-  }
-
-  // Validate mobile number
-  if (bookingData.mobile_number.length < 10) {
-    return res.status(400).json({
-      error: 'Invalid mobile number',
-      message: 'Mobile number must be at least 10 digits'
+      error: 'Invalid dates',
+      message: 'Check-out date must be after check-in date'
     });
   }
 
   try {
-    // Check if property exists and is available
-    const propertyCheck = await query(
-      'SELECT id, user_id, property_type, unit_type, address, price, is_active, approval_status FROM all_properties WHERE id = ?',
-      [propertyId]
-    );
+    const propertyQuery = `
+      SELECT id, user_id, price, property_type, unit_type, address, is_active, approval_status
+      FROM all_properties 
+      WHERE id = ? AND is_active = 1 AND approval_status = 'approved'
+    `;
+    const properties = await query(propertyQuery, [property_id]);
 
-    if (propertyCheck.length === 0) {
+    if (properties.length === 0) {
       return res.status(404).json({
         error: 'Property not found',
-        message: 'The specified property does not exist'
+        message: 'The selected property is not available for booking'
       });
     }
 
-    const property = propertyCheck[0];
-
-    if (!property.is_active || property.approval_status !== 'approved') {
-      return res.status(400).json({
-        error: 'Property not available',
-        message: 'This property is not currently available for booking'
-      });
-    }
+    const property = properties[0];
 
     if (property.user_id === userId) {
       return res.status(400).json({
-        error: 'Cannot book own property',
+        error: 'Invalid booking',
         message: 'You cannot book your own property'
       });
     }
 
-    // Check for existing pending booking from same user for same property
-    const existingBooking = await query(
-      'SELECT id FROM booking_requests WHERE user_id = ? AND property_id = ? AND status = ?',
-      [userId, propertyId, 'pending']
-    );
+    const timeDifference = checkOutDate.getTime() - checkInDate.getTime();
+    const bookingDays = Math.ceil(timeDifference / (1000 * 3600 * 24));
+    const bookingMonths = Math.ceil(bookingDays / 30);
+    
+    const monthlyPrice = parseFloat(property.price);
+    const totalPrice = monthlyPrice * bookingMonths;
+    const serviceFee = 300.00;
+    const advanceAmount = totalPrice * 0.30;
 
-    if (existingBooking.length > 0) {
+    const overlapQuery = `
+      SELECT COUNT(*) as count 
+      FROM booking_requests 
+      WHERE property_id = ? 
+      AND status IN ('approved', 'confirmed', 'payment_submitted')
+      AND (
+        (check_in_date <= ? AND check_out_date > ?) OR
+        (check_in_date < ? AND check_out_date >= ?) OR
+        (check_in_date >= ? AND check_out_date <= ?)
+      )
+    `;
+    
+    const overlapResult = await query(overlapQuery, [
+      property_id, check_in_date, check_in_date, check_out_date, check_out_date, 
+      check_in_date, check_out_date
+    ]);
+
+    if (overlapResult[0].count > 0) {
       return res.status(409).json({
-        error: 'Booking already exists',
-        message: 'You already have a pending booking for this property'
+        error: 'Booking conflict',
+        message: 'Property is not available for the selected dates'
       });
     }
 
-    // Validate gender if provided
-    if (bookingData.gender && !['male', 'female', 'other'].includes(bookingData.gender)) {
-      return res.status(400).json({
-        error: 'Invalid gender',
-        message: 'Gender must be male, female, or other'
-      });
-    }
-
-    // Validate birthdate if provided
-    if (bookingData.birthdate) {
-      const birthDate = new Date(bookingData.birthdate);
-      const minAge = new Date();
-      minAge.setFullYear(minAge.getFullYear() - 18);
-      
-      if (birthDate > minAge) {
-        return res.status(400).json({
-          error: 'Age restriction',
-          message: 'You must be at least 18 years old to make a booking'
-        });
-      }
-    }
-
-    // Insert booking request
     const insertQuery = `
       INSERT INTO booking_requests (
         user_id, property_id, property_owner_id, first_name, last_name, email,
-        country_code, mobile_number, birthdate, gender, nationality, occupation, field,
-        destination, purpose, requirements, stay_duration, preferred_start_date,
-        budget_range, adults, children, pets, special_needs, emergency_contact_name,
-        emergency_contact_phone, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+        country_code, mobile_number, birthdate, gender, nationality, occupation,
+        field, destination, relocation_details, check_in_date, check_out_date,
+        total_price, service_fee, advance_amount, booking_days, booking_months
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    const result = await query(insertQuery, [
-      userId,
-      propertyId,
-      property.user_id,
-      bookingData.first_name,
-      bookingData.last_name,
-      bookingData.email,
-      bookingData.country_code || '+94',
-      bookingData.mobile_number,
-      bookingData.birthdate || null,
-      bookingData.gender || null,
-      bookingData.nationality || null,
-      bookingData.occupation || null,
-      bookingData.field || null,
-      bookingData.destination || null,
-      bookingData.purpose || null,
-      bookingData.requirements || null,
-      bookingData.stay_duration || null,
-      bookingData.preferred_start_date || null,
-      bookingData.budget_range || null,
-      parseInt(bookingData.adults) || 1,
-      parseInt(bookingData.children) || 0,
-      parseInt(bookingData.pets) || 0,
-      bookingData.special_needs || null,
-      bookingData.emergency_contact_name || null,
-      bookingData.emergency_contact_phone || null,
-      'pending'
+    const insertResult = await query(insertQuery, [
+      userId, property_id, property.user_id, first_name, last_name, email,
+      country_code, mobile_number, birthdate || null, gender || null, 
+      nationality || null, occupation || null, field || null, 
+      destination || null, relocation_details || null, check_in_date, 
+      check_out_date, totalPrice, serviceFee, advanceAmount, bookingDays, bookingMonths
     ]);
 
-    const bookingId = result.insertId;
+    const bookingId = insertResult.insertId;
 
-    // Fetch the created booking
     const newBooking = await query(`
       SELECT 
         br.*,
@@ -232,12 +190,10 @@ router.get('/', auth, requireUser, async (req, res) => {
       queryParams.push(status);
     }
 
-    // Count total bookings
     const countQuery = `SELECT COUNT(*) as total FROM booking_requests br ${whereClause}`;
     const countResult = await query(countQuery, queryParams);
     const totalBookings = countResult[0].total;
 
-    // Get bookings with property info
     const bookingsQuery = `
       SELECT 
         br.*,
@@ -257,7 +213,8 @@ router.get('/', auth, requireUser, async (req, res) => {
     const processedBookings = bookings.map(booking => ({
       ...booking,
       images: safeJsonParse(booking.images),
-      price: parseFloat(booking.price)
+      price: parseFloat(booking.price),
+      advance_amount: parseFloat(booking.advance_amount)
     }));
 
     res.json({
@@ -310,12 +267,10 @@ router.get('/owner', auth, requirePropertyOwner, async (req, res) => {
       queryParams.push(parseInt(propertyId));
     }
 
-    // Count total bookings
     const countQuery = `SELECT COUNT(*) as total FROM booking_requests br ${whereClause}`;
     const countResult = await query(countQuery, queryParams);
     const totalBookings = countResult[0].total;
 
-    // Get bookings with property and tenant info
     const bookingsQuery = `
       SELECT 
         br.*,
@@ -335,7 +290,8 @@ router.get('/owner', auth, requirePropertyOwner, async (req, res) => {
     const processedBookings = bookings.map(booking => ({
       ...booking,
       images: safeJsonParse(booking.images),
-      price: parseFloat(booking.price)
+      price: parseFloat(booking.price),
+      advance_amount: parseFloat(booking.advance_amount)
     }));
 
     res.json({
@@ -405,7 +361,6 @@ router.get('/:id', auth, async (req, res) => {
 
     const booking = bookings[0];
 
-    // Check access permissions
     const canAccess = userRole === 'admin' || 
                      booking.user_id === userId || 
                      booking.property_owner_id === userId;
@@ -422,7 +377,8 @@ router.get('/:id', auth, async (req, res) => {
       amenities: safeJsonParse(booking.amenities),
       facilities: safeJsonParse(booking.facilities),
       images: safeJsonParse(booking.images),
-      price: parseFloat(booking.price)
+      price: parseFloat(booking.price),
+      advance_amount: parseFloat(booking.advance_amount)
     };
 
     res.json(processedBooking);
