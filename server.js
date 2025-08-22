@@ -15,6 +15,7 @@ const adminRoutes = require('./routes/admin');
 const profileRoutes = require('./routes/profile');
 const bookingRoutes = require('./routes/bookings');
 const uploadRoutes = require('./routes/upload');
+const { router: notificationRoutes } = require('./routes/notifications');
 
 const app = express();
 
@@ -53,9 +54,13 @@ app.use(morgan('combined', {
   }
 }));
 
+// Different rate limits for different environments
+const isDevelopment = process.env.NODE_ENV === 'development';
+
+// General rate limiter - more lenient for development
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
+  windowMs: 15 * 60 * 10000, // 15 minutes
+  max: isDevelopment ? 10000 : 1000, // 1000 requests for dev, 100 for production
   message: {
     error: 'Too many requests',
     message: 'Too many requests from this IP, please try again later.',
@@ -63,11 +68,39 @@ const limiter = rateLimit({
   },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    // Skip rate limiting for health checks and static assets
+    return req.path === '/health' || 
+           req.path.startsWith('/static/') || 
+           req.path.startsWith('/assets/');
+  },
   handler: (req, res) => {
-    console.log(`Rate limit exceeded for IP: ${req.ip}`);
+    console.log(`Rate limit exceeded for IP: ${req.ip} - Path: ${req.path}`);
     res.status(429).json({
       error: 'Too many requests',
       message: 'Too many requests from this IP, please try again later.',
+      retryAfter: '15 minutes',
+      path: req.path
+    });
+  }
+});
+
+// Strict rate limiter for sensitive operations
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: isDevelopment ? 50 : 10, // 50 requests for dev, 10 for production
+  message: {
+    error: 'Too many requests',
+    message: 'Too many sensitive operation requests. Please try again later.',
+    retryAfter: '15 minutes'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    console.log(`Strict rate limit exceeded for IP: ${req.ip} - Path: ${req.path}`);
+    res.status(429).json({
+      error: 'Too many requests',
+      message: 'Too many sensitive operation requests. Please try again later.',
       retryAfter: '15 minutes'
     });
   }
@@ -75,12 +108,17 @@ const limiter = rateLimit({
 
 app.use(limiter);
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// Apply strict rate limiting to sensitive endpoints
+app.use('/api/auth/login', strictLimiter);
+app.use('/api/auth/register', strictLimiter);
+app.use('/api/auth/forgot-password', strictLimiter);
+app.use('/api/auth/reset-password', strictLimiter);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 app.use((req, res, next) => {
-  req.requestId = Math.random().toString(36).substring(2);
-  req.timestamp = new Date().toISOString();
+  req.requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   next();
 });
 
@@ -91,26 +129,31 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/profile', profileRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/upload', uploadRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 app.get('/health', async (req, res) => {
   try {
-    const dbStatus = await healthCheck();
+    const dbHealth = await healthCheck();
+    
     res.json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV || 'development',
+      database: dbHealth.status === 'connected' ? 'healthy' : 'unhealthy',
       uptime: process.uptime(),
-      database: dbStatus,
-      memory: {
-        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
-      },
-      environment: process.env.NODE_ENV || 'development'
+      memory: process.memoryUsage(),
+      version: '1.0.0',
+      rateLimit: {
+        general: isDevelopment ? '1000 requests per 15 minutes' : '100 requests per 15 minutes',
+        auth: isDevelopment ? '50 requests per 15 minutes' : '10 requests per 15 minutes'
+      }
     });
   } catch (error) {
+    console.error('Health check failed:', error);
     res.status(503).json({
       status: 'unhealthy',
-      error: error.message,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      error: 'Health check failed'
     });
   }
 });
@@ -119,7 +162,7 @@ app.get('/api/docs', (req, res) => {
   res.json({
     title: 'StayWise API Documentation',
     version: '1.0.0',
-    description: 'Property rental management system API',
+    description: 'Comprehensive property rental management system API',
     endpoints: {
       authentication: {
         'POST /api/auth/login': 'User login',
@@ -152,10 +195,20 @@ app.get('/api/docs', (req, res) => {
         'GET /api/bookings/user': 'Get user bookings',
         'GET /api/bookings/owner': 'Get bookings for property owner',
         'PUT /api/bookings/:id/status': 'Update booking status'
+      },
+      notifications: {
+        'GET /api/notifications': 'Get user notifications',
+        'PUT /api/notifications/:id/read': 'Mark notification as read',
+        'PUT /api/notifications/mark-all-read': 'Mark all notifications as read',
+        'PUT /api/notifications/:id/action': 'Take action on notification (accept/reject)',
+        'GET /api/notifications/unread-count': 'Get unread notification count',
+        'DELETE /api/notifications/:id': 'Delete notification'
       }
     },
     authentication: 'Bearer token required for protected endpoints',
-    rateLimit: '100 requests per 15 minutes per IP'
+    rateLimit: isDevelopment 
+      ? 'Development: 1000 requests per 15 minutes per IP (Auth: 50 requests per 15 minutes)'
+      : 'Production: 100 requests per 15 minutes per IP (Auth: 10 requests per 15 minutes)'
   });
 });
 
@@ -164,6 +217,7 @@ app.get('/', (req, res) => {
     message: 'StayWise API Server',
     version: '1.0.0',
     status: 'active',
+    environment: process.env.NODE_ENV || 'development',
     documentation: '/api/docs',
     health: '/health'
   });
@@ -215,7 +269,15 @@ const startServer = async () => {
       console.log(`Server running on: http://localhost:${PORT}`);
       console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
       console.log(`Database: ${process.env.DB_NAME || 'staywise_db'}`);
-      console.log(`Rate limit: 100 requests per 15 minutes per IP`);
+      
+      if (isDevelopment) {
+        console.log(`Rate limit: 1000 requests per 15 minutes per IP (Development Mode)`);
+        console.log(`Auth rate limit: 50 requests per 15 minutes per IP (Development Mode)`);
+      } else {
+        console.log(`Rate limit: 100 requests per 15 minutes per IP (Production Mode)`);
+        console.log(`Auth rate limit: 10 requests per 15 minutes per IP (Production Mode)`);
+      }
+      
       console.log('\nAvailable API Endpoints:');
       console.log(`   Auth routes: http://localhost:${PORT}/api/auth`);
       console.log(`   Property routes: http://localhost:${PORT}/api/properties`);
@@ -224,6 +286,7 @@ const startServer = async () => {
       console.log(`   Admin routes: http://localhost:${PORT}/api/admin`);
       console.log(`   Profile routes: http://localhost:${PORT}/api/profile`);
       console.log(`   Booking routes: http://localhost:${PORT}/api/bookings`);
+      console.log(`   Notification routes: http://localhost:${PORT}/api/notifications`);
       console.log(`   Health check: http://localhost:${PORT}/health`);
       console.log(`   API docs: http://localhost:${PORT}/api/docs`);
       console.log('\nServer ready to accept connections!');
