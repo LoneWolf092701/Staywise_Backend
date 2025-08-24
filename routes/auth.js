@@ -97,9 +97,12 @@ router.post('/register', async (req, res) => {
       ];
 
       allowedFields.forEach(field => {
-        if (profile[field] !== undefined && profile[field] !== null && profile[field] !== '') {
-          profileFields.push(field);
-          profileValues.push(profile[field]);
+        if (profile[field] !== undefined && profile[field] !== null) {
+          const value = typeof profile[field] === 'string' ? profile[field].trim() : profile[field];
+          if (value !== '') {
+            profileFields.push(field);
+            profileValues.push(value);
+          }
         }
       });
 
@@ -110,8 +113,27 @@ router.post('/register', async (req, res) => {
           VALUES (?, ${profileFields.map(() => '?').join(', ')}, NOW(), NOW())
         `;
         
+        console.log('Inserting profile data:', { profileFields, profileValues });
         await query(profileQuery, profileValues);
+      } else {
+        console.log('No profile fields to insert for user:', userId);
+        
+        const emptyProfileQuery = `
+          INSERT INTO user_profiles 
+          (user_id, created_at, updated_at) 
+          VALUES (?, NOW(), NOW())
+        `;
+        await query(emptyProfileQuery, [userId]);
       }
+    } else {
+      console.log('Creating empty profile record for user:', userId);
+      
+      const emptyProfileQuery = `
+        INSERT INTO user_profiles 
+        (user_id, created_at, updated_at) 
+        VALUES (?, NOW(), NOW())
+      `;
+      await query(emptyProfileQuery, [userId]);
     }
 
     const newUser = {

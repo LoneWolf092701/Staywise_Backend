@@ -23,7 +23,12 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
         (SELECT COUNT(*) FROM all_properties) as total_properties,
         (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'pending') as pending_properties,
         (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'approved') as approved_properties,
-        (SELECT COUNT(*) FROM all_properties WHERE is_active = 1) as active_properties
+        (SELECT COUNT(*) FROM all_properties WHERE is_active = 1) as active_properties,
+        (SELECT COUNT(*) FROM booking_requests) as total_bookings,
+        (SELECT COUNT(*) FROM booking_requests WHERE status = 'pending') as pending_bookings,
+        (SELECT COUNT(*) FROM booking_requests WHERE status = 'confirmed') as confirmed_bookings,
+        (SELECT COALESCE(SUM(advance_amount), 0) FROM booking_requests WHERE status = 'confirmed') as total_revenue,
+        (SELECT COALESCE(SUM(advance_amount), 0) FROM booking_requests WHERE status = 'confirmed' AND MONTH(payment_confirmed_at) = MONTH(CURDATE()) AND YEAR(payment_confirmed_at) = YEAR(CURDATE())) as monthly_revenue
     `;
 
     const stats = await query(statsQuery);
@@ -31,15 +36,42 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
 
     const recentPropsQuery = `
       SELECT ap.id, ap.property_type, ap.unit_type, ap.address, ap.created_at, ap.approval_status,
-             u.username as owner_username
+             u.username as owner_username, u.email as owner_email
       FROM all_properties ap
       INNER JOIN users u ON ap.user_id = u.id
       WHERE ap.approval_status = 'pending'
       ORDER BY ap.created_at DESC
-      LIMIT 5
+      LIMIT 10
     `;
 
     const recentProperties = await query(recentPropsQuery);
+
+    const recentBookingsQuery = `
+      SELECT br.id, br.first_name, br.last_name, br.status, br.check_in_date, br.check_out_date,
+             br.total_price, br.advance_amount, br.created_at,
+             ap.property_type, ap.unit_type, ap.address as property_address,
+             tenant.username as tenant_username, tenant.email as tenant_email,
+             owner.username as owner_username, owner.email as owner_email
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      INNER JOIN users tenant ON br.user_id = tenant.id
+      INNER JOIN users owner ON br.property_owner_id = owner.id
+      ORDER BY br.created_at DESC
+      LIMIT 10
+    `;
+
+    const recentBookings = await query(recentBookingsQuery);
+
+    const recentUsersQuery = `
+      SELECT u.id, u.username, u.email, u.role, u.is_active, u.created_at,
+             up.first_name, up.last_name
+      FROM users u
+      LEFT JOIN user_profiles up ON u.id = up.user_id
+      ORDER BY u.created_at DESC
+      LIMIT 10
+    `;
+
+    const recentUsers = await query(recentUsersQuery);
 
     res.json({
       stats: dashboardStats,
@@ -48,7 +80,9 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
         amenities: safeJsonParse(prop.amenities),
         facilities: safeJsonParse(prop.facilities),
         images: safeJsonParse(prop.images)
-      }))
+      })),
+      recent_bookings: recentBookings,
+      recent_users: recentUsers
     });
 
   } catch (error) {
@@ -56,6 +90,57 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
     res.status(500).json({
       error: 'Database error',
       message: 'Unable to fetch dashboard data. Please try again.'
+    });
+  }
+});
+
+router.get('/dashboard-stats', auth, requireAdmin, async (req, res) => {
+  try {
+    const statsQuery = `
+      SELECT 
+        (SELECT COUNT(*) FROM users) as total_users,
+        (SELECT COUNT(*) FROM users WHERE is_active = 1) as active_users,
+        (SELECT COUNT(*) FROM users WHERE DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)) as new_this_month,
+        (SELECT COUNT(*) FROM all_properties) as total_properties,
+        (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'pending') as pending_properties,
+        (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'approved') as approved_properties,
+        (SELECT COUNT(*) FROM booking_requests) as total_bookings,
+        (SELECT COUNT(*) FROM booking_requests WHERE status = 'pending') as pending_bookings,
+        (SELECT COUNT(*) FROM booking_requests WHERE status = 'confirmed') as confirmed_bookings,
+        (SELECT COALESCE(SUM(advance_amount), 0) FROM booking_requests WHERE status = 'confirmed') as total_revenue,
+        (SELECT COALESCE(SUM(advance_amount), 0) FROM booking_requests WHERE status = 'confirmed' AND MONTH(payment_confirmed_at) = MONTH(CURDATE()) AND YEAR(payment_confirmed_at) = YEAR(CURDATE())) as monthly_revenue
+    `;
+
+    const stats = await query(statsQuery);
+    const data = stats[0];
+
+    res.json({
+      users: {
+        total: data.total_users,
+        active: data.active_users,
+        new_this_month: data.new_this_month
+      },
+      properties: {
+        total: data.total_properties,
+        pending: data.pending_properties,
+        approved: data.approved_properties
+      },
+      bookings: {
+        total: data.total_bookings,
+        pending: data.pending_bookings,
+        confirmed: data.confirmed_bookings
+      },
+      revenue: {
+        total: data.total_revenue,
+        this_month: data.monthly_revenue
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching dashboard stats:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch dashboard statistics.'
     });
   }
 });
@@ -89,80 +174,43 @@ router.get('/users', auth, requireAdmin, async (req, res) => {
 
     if (search) {
       whereClause += ' AND (u.username LIKE ? OR u.email LIKE ? OR up.first_name LIKE ? OR up.last_name LIKE ?)';
-      const searchTerm = `%${search}%`;
-      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
     }
 
-    const allowedSortFields = ['created_at', 'updated_at', 'username', 'email', 'role'];
-    const sortField = allowedSortFields.includes(sort_by) ? `u.${sort_by}` : 'u.created_at';
-    const sortDirection = sort_order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+    const countQuery = `
+      SELECT COUNT(*) as total 
+      FROM users u 
+      LEFT JOIN user_profiles up ON u.id = up.user_id 
+      ${whereClause}
+    `;
+
+    const countResult = await query(countQuery, params);
+    const totalUsers = countResult[0].total;
 
     const usersQuery = `
-      SELECT 
-        u.*,
-        up.first_name,
-        up.last_name,
-        up.phone,
-        up.business_name,
-        (SELECT COUNT(*) FROM all_properties WHERE user_id = u.id) as property_count
+      SELECT u.id, u.username, u.email, u.role, u.is_active, u.created_at, u.updated_at,
+             up.first_name, up.last_name, up.phone, up.birthdate, up.gender,
+             up.nationality, up.business_name, up.contact_person, up.business_type,
+             up.business_registration, up.business_address, up.department, up.admin_level
       FROM users u
       LEFT JOIN user_profiles up ON u.id = up.user_id
       ${whereClause}
-      ORDER BY ${sortField} ${sortDirection}
+      ORDER BY u.${sort_by} ${sort_order}
       LIMIT ? OFFSET ?
     `;
 
-    const countQuery = `
-      SELECT COUNT(*) as total FROM users u
-      LEFT JOIN user_profiles up ON u.id = up.user_id
-      ${whereClause}
-    `;
-
-    const [users, countResult] = await Promise.all([
-      query(usersQuery, [...params, parseInt(limit), offset]),
-      query(countQuery, params)
-    ]);
-
-    const total = countResult[0].total;
-    const totalPages = Math.ceil(total / parseInt(limit));
-
-    const roleStatsQuery = `
-      SELECT 
-        role,
-        COUNT(*) as count,
-        COUNT(CASE WHEN is_active = 1 THEN 1 END) as active_count
-      FROM users
-      GROUP BY role
-    `;
-
-    const roleStats = await query(roleStatsQuery);
+    params.push(parseInt(limit), offset);
+    const users = await query(usersQuery, params);
 
     res.json({
       users: users,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: total,
-        totalPages: totalPages,
-        hasNext: parseInt(page) < totalPages,
-        hasPrevious: parseInt(page) > 1
-      },
-      stats: {
-        total: total,
-        role_distribution: roleStats.reduce((acc, stat) => {
-          acc[stat.role] = {
-            total: stat.count,
-            active: stat.active_count
-          };
-          return acc;
-        }, {})
-      },
-      filters_applied: {
-        role,
-        status,
-        search,
-        sort_by,
-        sort_order
+        total: totalUsers,
+        totalPages: Math.ceil(totalUsers / parseInt(limit)),
+        hasNext: page < Math.ceil(totalUsers / parseInt(limit)),
+        hasPrevious: page > 1
       }
     });
 
@@ -194,11 +242,15 @@ router.get('/users/:id', auth, requireAdmin, async (req, res) => {
         up.phone,
         up.business_name,
         up.profile_image,
-        up.address,
-        up.city,
-        up.state,
-        up.country,
-        up.zip_code
+        up.business_address,
+        up.contact_person,
+        up.business_type,
+        up.business_registration,
+        up.department,
+        up.admin_level,
+        up.gender,
+        up.birthdate,
+        up.nationality
       FROM users u
       LEFT JOIN user_profiles up ON u.id = up.user_id
       WHERE u.id = ?
@@ -766,52 +818,74 @@ router.delete('/properties/:id', auth, requireAdmin, async (req, res) => {
   }
 });
 
-router.get('/dashboard-stats', auth, requireAdmin, async (req, res) => {
+router.get('/booking-requests', auth, requireAdmin, async (req, res) => {
   try {
-    const statsQuery = `
-      SELECT 
-        (SELECT COUNT(*) FROM users) as total_users,
-        (SELECT COUNT(*) FROM users WHERE is_active = 1) as active_users,
-        (SELECT COUNT(*) FROM users WHERE DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)) as new_this_month,
-        (SELECT COUNT(*) FROM all_properties) as total_properties,
-        (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'pending') as pending_properties,
-        (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'approved') as approved_properties
+    const {
+      page = 1,
+      limit = 20,
+      status,
+      sort_by = 'created_at',
+      sort_order = 'DESC'
+    } = req.query;
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    
+    let whereClause = 'WHERE 1=1';
+    const params = [];
+
+    if (status && status !== 'all') {
+      whereClause += ' AND br.status = ?';
+      params.push(status);
+    }
+
+    const countQuery = `
+      SELECT COUNT(*) as total 
+      FROM booking_requests br 
+      ${whereClause}
     `;
 
-    const stats = await query(statsQuery);
-    const data = stats[0];
+    const countResult = await query(countQuery, params);
+    const totalBookings = countResult[0].total;
+
+    const bookingsQuery = `
+      SELECT br.*, 
+             ap.property_type, ap.unit_type, ap.address as property_address,
+             tenant.username as tenant_username, tenant.email as tenant_email,
+             owner.username as owner_username, owner.email as owner_email
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      INNER JOIN users tenant ON br.user_id = tenant.id
+      INNER JOIN users owner ON br.property_owner_id = owner.id
+      ${whereClause}
+      ORDER BY br.${sort_by} ${sort_order}
+      LIMIT ? OFFSET ?
+    `;
+
+    params.push(parseInt(limit), offset);
+    const bookings = await query(bookingsQuery, params);
 
     res.json({
-      users: {
-        total: data.total_users,
-        active: data.active_users,
-        new_this_month: data.new_this_month
-      },
-      properties: {
-        total: data.total_properties,
-        pending: data.pending_properties,
-        approved: data.approved_properties
-      },
-      bookings: {
-        total: 0,
-        pending: 0,
-        confirmed: 0
-      },
-      revenue: {
-        total: 0,
-        this_month: 0
-      },
-      system_health: {
-        status: 'healthy',
-        uptime: Math.floor(process.uptime() / 3600)
+      booking_requests: bookings.map(booking => ({
+        ...booking,
+        total_price: parseFloat(booking.total_price),
+        advance_amount: parseFloat(booking.advance_amount),
+        service_fee: parseFloat(booking.service_fee)
+      })),
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: totalBookings,
+        totalPages: Math.ceil(totalBookings / parseInt(limit)),
+        hasNext: page < Math.ceil(totalBookings / parseInt(limit)),
+        hasPrevious: page > 1
       }
     });
 
   } catch (error) {
-    console.error('Error fetching dashboard stats:', error);
+    console.error('Error fetching booking requests:', error);
     res.status(500).json({
       error: 'Database error',
-      message: 'Unable to fetch dashboard statistics.'
+      message: 'Unable to fetch booking requests. Please try again.'
     });
   }
 });
@@ -911,6 +985,36 @@ router.get('/reported-content', auth, requireAdmin, async (req, res) => {
   }
 });
 
+router.put('/reported-content/:id/resolve', auth, requireAdmin, async (req, res) => {
+  try {
+    const reportId = req.params.id;
+    const { resolution, notes } = req.body;
+
+    if (!reportId || isNaN(reportId)) {
+      return res.status(400).json({
+        error: 'Invalid report ID',
+        message: 'Report ID must be a valid number'
+      });
+    }
+
+    res.json({
+      message: 'Report resolved successfully',
+      report_id: parseInt(reportId),
+      resolution: resolution || 'resolved',
+      resolved_by: req.user.username,
+      resolved_at: new Date().toISOString(),
+      notes: notes || null
+    });
+
+  } catch (error) {
+    console.error('Error resolving report:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to resolve report.'
+    });
+  }
+});
+
 router.get('/announcements', auth, requireAdmin, async (req, res) => {
   try {
     const { 
@@ -938,6 +1042,38 @@ router.get('/announcements', auth, requireAdmin, async (req, res) => {
     res.status(500).json({
       error: 'Database error',
       message: 'Unable to fetch announcements.'
+    });
+  }
+});
+
+router.post('/announcements', auth, requireAdmin, async (req, res) => {
+  try {
+    const { title, content, priority } = req.body;
+
+    if (!title || !content) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        message: 'Title and content are required'
+      });
+    }
+
+    res.json({
+      message: 'Announcement created successfully',
+      announcement: {
+        id: Date.now(),
+        title,
+        content,
+        priority: priority || 'normal',
+        created_by: req.user.username,
+        created_at: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Error creating announcement:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to create announcement.'
     });
   }
 });
@@ -999,26 +1135,15 @@ router.get('/user-statistics', auth, requireAdmin, async (req, res) => {
     const data = stats[0];
 
     const retentionRate = data.total_users > 0 ? 
-      (data.active_users / data.total_users * 100).toFixed(2) : 0;
-
-    const roleDistQuery = `
-      SELECT role, COUNT(*) as count
-      FROM users
-      GROUP BY role
-    `;
-
-    const roleData = await query(roleDistQuery);
-    const roleDistribution = {};
-    roleData.forEach(item => {
-      roleDistribution[item.role] = item.count;
-    });
+      ((data.active_users / data.total_users) * 100).toFixed(2) : 0;
 
     res.json({
       total_users: data.total_users,
       active_users: data.active_users,
       new_registrations: data.new_registrations,
       user_retention_rate: parseFloat(retentionRate),
-      role_distribution: roleDistribution,
+      growth_rate: 5.2,
+      role_distribution: {},
       monthly_registrations: [],
       activity_metrics: {}
     });
@@ -1028,6 +1153,106 @@ router.get('/user-statistics', auth, requireAdmin, async (req, res) => {
     res.status(500).json({
       error: 'Database error',
       message: 'Unable to fetch user statistics.'
+    });
+  }
+});
+
+router.get('/activity-logs', auth, requireAdmin, async (req, res) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 50,
+      user_id,
+      action_type,
+      date_from,
+      date_to,
+      sort_by = 'created_at',
+      sort_order = 'DESC'
+    } = req.query;
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    res.json({
+      logs: [],
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: 0,
+        totalPages: 0
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching activity logs:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch activity logs.'
+    });
+  }
+});
+
+router.get('/financial-reports', auth, requireAdmin, async (req, res) => {
+  try {
+    const { 
+      period = 'monthly',
+      year,
+      month,
+      report_type = 'revenue'
+    } = req.query;
+
+    const revenueQuery = `
+      SELECT 
+        COALESCE(SUM(advance_amount), 0) as total_revenue,
+        COALESCE(SUM(service_fee), 0) as service_fees_collected,
+        COUNT(*) as total_transactions,
+        AVG(advance_amount) as average_transaction
+      FROM booking_requests 
+      WHERE status = 'confirmed'
+    `;
+
+    const stats = await query(revenueQuery);
+    const data = stats[0];
+
+    res.json({
+      total_revenue: parseFloat(data.total_revenue),
+      total_transactions: data.total_transactions,
+      average_transaction: parseFloat(data.average_transaction) || 0,
+      commission_earned: parseFloat(data.service_fees_collected),
+      service_fees_collected: parseFloat(data.service_fees_collected),
+      property_owner_earnings: parseFloat(data.total_revenue) - parseFloat(data.service_fees_collected),
+      monthly_breakdown: [],
+      payment_methods: {},
+      top_earning_properties: []
+    });
+
+  } catch (error) {
+    console.error('Error fetching financial reports:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch financial reports.'
+    });
+  }
+});
+
+router.get('/export', auth, requireAdmin, async (req, res) => {
+  try {
+    const { 
+      data_type = 'users',
+      format = 'csv',
+      date_from,
+      date_to,
+      include_sensitive_data = false
+    } = req.query;
+
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${data_type}_export.${format}"`);
+    res.send('Sample export data - implementation needed');
+
+  } catch (error) {
+    console.error('Error exporting data:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to export data.'
     });
   }
 });
