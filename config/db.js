@@ -4,7 +4,7 @@ require('dotenv').config();
 const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASS || 'Dustan123',
+  password: process.env.DB_PASS || 'harenie2121',
   database: process.env.DB_NAME || 'staywise_db',
   port: process.env.DB_PORT || 3306,
   connectionLimit: 20,
