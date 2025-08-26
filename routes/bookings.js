@@ -703,4 +703,22 @@ router.delete('/:id', auth, async (req, res) => {
   }
 });
 
+// GET /api/bookings/user/stats  
+router.get('/user/stats', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const [activeBookings] = await Promise.all([
+      query('SELECT COUNT(*) as activeBookings FROM booking_requests WHERE user_id = ? AND status IN ("approved", "payment_submitted", "confirmed")', [userId])
+    ]);
+
+    res.json({
+      activeBookings: activeBookings[0]?.activeBookings || 0
+    });
+  } catch (error) {
+    console.error('Error fetching booking stats:', error);
+    res.status(500).json({ error: 'Failed to fetch booking stats' });
+  }
+});
+
 module.exports = router;
