@@ -735,4 +735,24 @@ router.delete('/rating/:property_id', auth, async (req, res) => {
   }
 });
 
+// GET /api/user-interactions/stats
+router.get('/stats', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const [viewStats, ratingStats] = await Promise.all([
+      query('SELECT COUNT(*) as totalViews FROM user_interactions WHERE user_id = ? AND interaction_type = "view"', [userId]),
+      query('SELECT COUNT(*) as totalRatings FROM user_interactions WHERE user_id = ? AND interaction_type = "rating"', [userId])
+    ]);
+
+    res.json({
+      totalViews: viewStats[0]?.totalViews || 0,
+      totalRatings: ratingStats[0]?.totalRatings || 0
+    });
+  } catch (error) {
+    console.error('Error fetching user interaction stats:', error);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
 module.exports = router;
