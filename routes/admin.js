@@ -63,7 +63,7 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
     const recentBookings = await query(recentBookingsQuery);
 
     const recentUsersQuery = `
-      SELECT u.id, u.username, u.email, u.role, u.is_active, u.created_at,
+      SELECT u.id, u.username, u.email, u.role, u.email_verified, u.is_active, u.created_at,
              up.first_name, up.last_name
       FROM users u
       LEFT JOIN user_profiles up ON u.id = up.user_id
@@ -188,9 +188,9 @@ router.get('/users', auth, requireAdmin, async (req, res) => {
     const totalUsers = countResult[0].total;
 
     const usersQuery = `
-      SELECT u.id, u.username, u.email, u.role, u.is_active, u.created_at, u.updated_at,
+      SELECT u.id, u.username, u.email, u.email_verified, u.role, u.is_active, u.created_at, u.updated_at,
              up.first_name, up.last_name, up.phone, up.birthdate, up.gender,
-             up.nationality, up.business_name, up.contact_person, up.business_type,
+             up.nationality, up.identification_number, up.business_name, up.contact_person, up.business_type,
              up.business_registration, up.business_address, up.department, up.admin_level
       FROM users u
       LEFT JOIN user_profiles up ON u.id = up.user_id
@@ -250,7 +250,8 @@ router.get('/users/:id', auth, requireAdmin, async (req, res) => {
         up.admin_level,
         up.gender,
         up.birthdate,
-        up.nationality
+        up.nationality,
+        up.identification_number,
       FROM users u
       LEFT JOIN user_profiles up ON u.id = up.user_id
       WHERE u.id = ?
@@ -1253,6 +1254,90 @@ router.get('/export', auth, requireAdmin, async (req, res) => {
     res.status(500).json({
       error: 'Database error',
       message: 'Unable to export data.'
+    });
+  }
+});
+
+// POST /api/admin/users/:id/verify-email
+router.post('/users/:id/verify-email', auth, requireAdmin, async (req, res) => {
+  const userId = req.params.id;
+
+  if (!userId || isNaN(userId)) {
+    return res.status(400).json({
+      error: 'Invalid user ID',
+      message: 'User ID must be a valid number'
+    });
+  }
+
+  try {
+    await query(
+      'UPDATE users SET email_verified = 1, email_verification_token = NULL, updated_at = NOW() WHERE id = ?',
+      [userId]
+    );
+
+    res.json({
+      message: 'User email verified successfully',
+      success: true
+    });
+
+  } catch (error) {
+    console.error('Error verifying user email:', error);
+    res.status(500).json({
+      error: 'Verification failed',
+      message: 'Unable to verify user email. Please try again.'
+    });
+  }
+});
+
+// POST /api/admin/users/:id/resend-verification
+router.post('/users/:id/resend-verification', auth, requireAdmin, async (req, res) => {
+  const userId = req.params.id;
+
+  try {
+    const users = await query(
+      'SELECT email, username, email_verified FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        error: 'User not found'
+      });
+    }
+
+    const user = users[0];
+
+    if (user.email_verified) {
+      return res.status(400).json({
+        error: 'Email already verified'
+      });
+    }
+
+    // Generate new verification token
+    const crypto = require('crypto');
+    const emailVerificationToken = crypto.randomBytes(32).toString('hex');
+    
+    await query(
+      'UPDATE users SET email_verification_token = ?, updated_at = NOW() WHERE id = ?',
+      [emailVerificationToken, userId]
+    );
+
+    // Send verification email
+    const { sendEmailVerification } = require('../services/emailService');
+    try {
+      await sendEmailVerification(user.email, emailVerificationToken, user.username);
+    } catch (emailError) {
+      console.error('Failed to send verification email:', emailError);
+    }
+
+    res.json({
+      message: 'Verification email sent successfully'
+    });
+
+  } catch (error) {
+    console.error('Error resending verification:', error);
+    res.status(500).json({
+      error: 'Failed to resend verification email'
     });
   }
 });

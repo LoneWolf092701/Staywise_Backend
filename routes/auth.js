@@ -99,7 +99,7 @@ router.post('/register', async (req, res) => {
       const profileValues = [userId];
       
       const allowedFields = [
-        'first_name', 'last_name', 'phone', 'gender', 'birthdate', 'nationality',
+        'first_name', 'last_name', 'phone', 'gender', 'birthdate', 'nationality', 'identification_number',
         'business_name', 'contact_person', 'business_type', 'business_registration', 'business_address',
         'department', 'admin_level'
       ];
