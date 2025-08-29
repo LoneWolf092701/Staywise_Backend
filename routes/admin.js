@@ -13,6 +13,29 @@ const safeJsonParse = (str) => {
   }
 };
 
+const validateCoordinates = (latitude, longitude) => {
+  if (latitude !== null && longitude !== null) {
+    const lat = parseFloat(latitude);
+    const lng = parseFloat(longitude);
+    
+    if (isNaN(lat) || isNaN(lng)) {
+      return { valid: false, error: 'Invalid coordinate format' };
+    }
+    
+    if (lat < -90 || lat > 90) {
+      return { valid: false, error: 'Latitude must be between -90 and 90' };
+    }
+    
+    if (lng < -180 || lng > 180) {
+      return { valid: false, error: 'Longitude must be between -180 and 180' };
+    }
+    
+    return { valid: true, lat, lng };
+  }
+  
+  return { valid: true, lat: null, lng: null };
+};
+
 router.get('/dashboard', auth, requireAdmin, async (req, res) => {
   try {
     const statsQuery = `
@@ -251,7 +274,7 @@ router.get('/users/:id', auth, requireAdmin, async (req, res) => {
         up.gender,
         up.birthdate,
         up.nationality,
-        up.identification_number,
+        up.identification_number
       FROM users u
       LEFT JOIN user_profiles up ON u.id = up.user_id
       WHERE u.id = ?
@@ -601,6 +624,8 @@ router.get('/properties/:id', auth, requireAdmin, async (req, res) => {
     const property = properties[0];
     const processedProperty = {
       ...property,
+      latitude: property.latitude ? parseFloat(property.latitude) : null,
+      longitude: property.longitude ? parseFloat(property.longitude) : null,
       price: parseFloat(property.price),
       amenities: safeJsonParse(property.amenities),
       facilities: safeJsonParse(property.facilities),

@@ -868,6 +868,8 @@ router.post('/', auth, requirePropertyOwner, async (req, res) => {
       property_type: propertyData.property_type,
       unit_type: propertyData.unit_type,
       address: propertyData.address,
+       latitude: propertyData.latitude || null,
+      longitude: propertyData.longitude || null,
       description: propertyData.description,
       price: parseFloat(propertyData.price),
       bedrooms: parseInt(propertyData.bedrooms) || 0,
@@ -893,11 +895,11 @@ router.post('/', auth, requirePropertyOwner, async (req, res) => {
 
     const insertQuery = `
       INSERT INTO all_properties (
-        user_id, property_type, unit_type, address, description, price,
+        user_id, property_type, unit_type, address, latitude, longitude, description, price,
         bedrooms, bathrooms, available_from, available_to, contract_policy, 
         amenities, facilities, images, rules, roommates, bills_inclusive,
         is_active, approval_status, views_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
     `;
 
     const result = await query(insertQuery, [
@@ -905,6 +907,8 @@ router.post('/', auth, requirePropertyOwner, async (req, res) => {
       mappedData.property_type,
       mappedData.unit_type,
       mappedData.address,
+      mappedData.latitude,
+      mappedData.longitude,
       mappedData.description,
       mappedData.price,
       mappedData.bedrooms,
@@ -965,6 +969,8 @@ router.put('/:id', auth, requirePropertyOwnership, async (req, res) => {
       property_type: propertyData.property_type,
       unit_type: propertyData.unit_type,
       address: propertyData.address,
+      latitude: propertyData.latitude || null,
+      longitude: propertyData.longitude || null,
       description: propertyData.description,
       price: parseFloat(propertyData.price),
       bedrooms: parseInt(propertyData.bedrooms) || 0,
@@ -985,6 +991,8 @@ router.put('/:id', auth, requirePropertyOwnership, async (req, res) => {
         property_type = ?, 
         unit_type = ?, 
         address = ?, 
+        latitude = ?,
+        longitude = ?,
         description = ?, 
         price = ?, 
         bedrooms = ?,
@@ -1006,6 +1014,8 @@ router.put('/:id', auth, requirePropertyOwnership, async (req, res) => {
       mappedData.property_type,
       mappedData.unit_type,
       mappedData.address,
+      mappedData.latitude,
+      mappedData.longitude,
       mappedData.description,
       mappedData.price,
       mappedData.bedrooms,
