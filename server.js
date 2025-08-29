@@ -16,6 +16,7 @@ const profileRoutes = require('./routes/profile');
 const bookingRoutes = require('./routes/bookings');
 const uploadRoutes = require('./routes/upload');
 const { router: notificationRoutes } = require('./routes/notifications');
+const settingsRoutes = require('./routes/settings');
 
 const app = express();
 
@@ -130,6 +131,7 @@ app.use('/api/profile', profileRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/settings', settingsRoutes);
 
 app.get('/health', async (req, res) => {
   try {

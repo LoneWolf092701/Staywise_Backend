@@ -1376,4 +1376,116 @@ router.delete('/:id', auth, requirePropertyOwnership, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/properties/owner/dashboard
+ * Get property owner dashboard data with stats and recent properties
+ */
+router.get('/owner/dashboard', auth, requirePropertyOwner, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    // Get property statistics
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total_properties,
+        COUNT(CASE WHEN approval_status = 'approved' THEN 1 END) as approved_properties,
+        COUNT(CASE WHEN approval_status = 'pending' THEN 1 END) as pending_properties,
+        COUNT(CASE WHEN approval_status = 'rejected' THEN 1 END) as rejected_properties,
+        COUNT(CASE WHEN is_active = 1 THEN 1 END) as active_properties,
+        SUM(views_count) as total_views,
+        AVG(price) as average_price
+      FROM all_properties 
+      WHERE user_id = ?
+    `;
+
+    const propertyStats = await query(statsQuery, [userId]);
+
+    // Get booking statistics
+    const bookingStatsQuery = `
+      SELECT 
+        COUNT(br.id) as total_bookings,
+        COUNT(CASE WHEN br.status = 'pending' THEN 1 END) as pending_bookings,
+        COUNT(CASE WHEN br.status = 'confirmed' THEN 1 END) as confirmed_bookings,
+        COUNT(CASE WHEN br.status = 'cancelled' THEN 1 END) as cancelled_bookings,
+        COALESCE(SUM(br.total_price), 0) as total_revenue,
+        COALESCE(SUM(br.advance_amount), 0) as advance_collected
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      WHERE ap.user_id = ?
+    `;
+
+    const bookingStats = await query(bookingStatsQuery, [userId]);
+
+    // Get recent properties (last 5)
+    const recentPropertiesQuery = `
+      SELECT ap.id, ap.property_type, ap.unit_type, ap.address, ap.price, 
+             ap.approval_status, ap.is_active, ap.views_count, ap.created_at,
+             ap.images, ap.amenities, ap.facilities
+      FROM all_properties ap
+      WHERE ap.user_id = ?
+      ORDER BY ap.created_at DESC
+      LIMIT 5
+    `;
+
+    const recentProperties = await query(recentPropertiesQuery, [userId]);
+
+    // Get recent bookings
+    const recentBookingsQuery = `
+      SELECT br.id, br.first_name, br.last_name, br.status, 
+             br.check_in_date, br.check_out_date, br.total_price, 
+             br.advance_amount, br.created_at,
+             ap.property_type, ap.address as property_address
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      WHERE ap.user_id = ?
+      ORDER BY br.created_at DESC
+      LIMIT 5
+    `;
+
+    const recentBookings = await query(recentBookingsQuery, [userId]);
+
+    // Process properties data
+    const processedProperties = recentProperties.map(property => {
+      const processedProperty = { ...property };
+      
+      try {
+        processedProperty.images = property.images ? JSON.parse(property.images) : [];
+      } catch (e) {
+        processedProperty.images = [];
+      }
+      
+      try {
+        processedProperty.amenities = property.amenities ? JSON.parse(property.amenities) : {};
+      } catch (e) {
+        processedProperty.amenities = {};
+      }
+      
+      try {
+        processedProperty.facilities = property.facilities ? JSON.parse(property.facilities) : {};
+      } catch (e) {
+        processedProperty.facilities = {};
+      }
+      
+      return processedProperty;
+    });
+
+    res.json({
+      stats: {
+        property_stats: propertyStats[0],
+        booking_stats: bookingStats[0]
+      },
+      recent_properties: processedProperties,
+      recent_bookings: recentBookings,
+      last_updated: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error fetching owner dashboard:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch dashboard data. Please try again.'
+    });
+  }
+});
+
 module.exports = router;
