@@ -269,7 +269,7 @@ router.get('/public', async (req, res) => {
 
 /**
  * GET /api/properties/public/:id
- * Get a single public property by ID
+ * Get a single public property by ID with owner information
  */
 router.get('/public/:id', optionalAuth, async (req, res) => {
   const propertyId = req.params.id;
@@ -282,10 +282,22 @@ router.get('/public/:id', optionalAuth, async (req, res) => {
   }
 
   try {
-    const properties = await query(
-      'SELECT * FROM all_properties WHERE id = ? AND approval_status = ? AND is_active = ?',
-      [propertyId, 'approved', 1]
-    );
+    const propertyQuery = `
+      SELECT 
+        p.*,
+        u.username as owner_name,
+        u.email as owner_email,
+        up.business_name as owner_business_name,
+        up.phone as owner_phone,
+        up.first_name as owner_first_name,
+        up.last_name as owner_last_name
+      FROM all_properties p
+      LEFT JOIN users u ON p.user_id = u.id
+      LEFT JOIN user_profiles up ON u.id = up.user_id
+      WHERE p.id = ? AND p.approval_status = ? AND p.is_active = ?
+    `;
+
+    const properties = await query(propertyQuery, [propertyId, 'approved', 1]);
 
     if (properties.length === 0) {
       return res.status(404).json({
@@ -295,7 +307,25 @@ router.get('/public/:id', optionalAuth, async (req, res) => {
     }
 
     const property = properties[0];
-    const processedProperty = processPropertyData(property);
+    const processedProperty = {
+      ...processPropertyData(property),
+      owner_info: {
+        username: property.owner_name,
+        email: property.owner_email,
+        business_name: property.owner_business_name,
+        phone: property.owner_phone,
+        first_name: property.owner_first_name,
+        last_name: property.owner_last_name
+      }
+    };
+
+    // Clean up temporary fields
+    delete processedProperty.owner_name;
+    delete processedProperty.owner_email;
+    delete processedProperty.owner_business_name;
+    delete processedProperty.owner_phone;
+    delete processedProperty.owner_first_name;
+    delete processedProperty.owner_last_name;
 
     // Increment views count
     try {
@@ -868,6 +898,8 @@ router.post('/', auth, requirePropertyOwner, async (req, res) => {
       property_type: propertyData.property_type,
       unit_type: propertyData.unit_type,
       address: propertyData.address,
+       latitude: propertyData.latitude || null,
+      longitude: propertyData.longitude || null,
       description: propertyData.description,
       price: parseFloat(propertyData.price),
       bedrooms: parseInt(propertyData.bedrooms) || 0,
@@ -893,11 +925,11 @@ router.post('/', auth, requirePropertyOwner, async (req, res) => {
 
     const insertQuery = `
       INSERT INTO all_properties (
-        user_id, property_type, unit_type, address, description, price,
+        user_id, property_type, unit_type, address, latitude, longitude, description, price,
         bedrooms, bathrooms, available_from, available_to, contract_policy, 
         amenities, facilities, images, rules, roommates, bills_inclusive,
         is_active, approval_status, views_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
     `;
 
     const result = await query(insertQuery, [
@@ -905,6 +937,8 @@ router.post('/', auth, requirePropertyOwner, async (req, res) => {
       mappedData.property_type,
       mappedData.unit_type,
       mappedData.address,
+      mappedData.latitude,
+      mappedData.longitude,
       mappedData.description,
       mappedData.price,
       mappedData.bedrooms,
@@ -965,6 +999,8 @@ router.put('/:id', auth, requirePropertyOwnership, async (req, res) => {
       property_type: propertyData.property_type,
       unit_type: propertyData.unit_type,
       address: propertyData.address,
+      latitude: propertyData.latitude || null,
+      longitude: propertyData.longitude || null,
       description: propertyData.description,
       price: parseFloat(propertyData.price),
       bedrooms: parseInt(propertyData.bedrooms) || 0,
@@ -985,6 +1021,8 @@ router.put('/:id', auth, requirePropertyOwnership, async (req, res) => {
         property_type = ?, 
         unit_type = ?, 
         address = ?, 
+        latitude = ?,
+        longitude = ?,
         description = ?, 
         price = ?, 
         bedrooms = ?,
@@ -1006,6 +1044,8 @@ router.put('/:id', auth, requirePropertyOwnership, async (req, res) => {
       mappedData.property_type,
       mappedData.unit_type,
       mappedData.address,
+      mappedData.latitude,
+      mappedData.longitude,
       mappedData.description,
       mappedData.price,
       mappedData.bedrooms,
@@ -1332,6 +1372,118 @@ router.delete('/:id', auth, requirePropertyOwnership, async (req, res) => {
     res.status(500).json({
       error: 'Database error',
       message: 'Unable to delete property. Please try again.'
+    });
+  }
+});
+
+/**
+ * GET /api/properties/owner/dashboard
+ * Get property owner dashboard data with stats and recent properties
+ */
+router.get('/owner/dashboard', auth, requirePropertyOwner, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    // Get property statistics
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total_properties,
+        COUNT(CASE WHEN approval_status = 'approved' THEN 1 END) as approved_properties,
+        COUNT(CASE WHEN approval_status = 'pending' THEN 1 END) as pending_properties,
+        COUNT(CASE WHEN approval_status = 'rejected' THEN 1 END) as rejected_properties,
+        COUNT(CASE WHEN is_active = 1 THEN 1 END) as active_properties,
+        SUM(views_count) as total_views,
+        AVG(price) as average_price
+      FROM all_properties 
+      WHERE user_id = ?
+    `;
+
+    const propertyStats = await query(statsQuery, [userId]);
+
+    // Get booking statistics
+    const bookingStatsQuery = `
+      SELECT 
+        COUNT(br.id) as total_bookings,
+        COUNT(CASE WHEN br.status = 'pending' THEN 1 END) as pending_bookings,
+        COUNT(CASE WHEN br.status = 'confirmed' THEN 1 END) as confirmed_bookings,
+        COUNT(CASE WHEN br.status = 'cancelled' THEN 1 END) as cancelled_bookings,
+        COALESCE(SUM(br.total_price), 0) as total_revenue,
+        COALESCE(SUM(br.advance_amount), 0) as advance_collected
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      WHERE ap.user_id = ?
+    `;
+
+    const bookingStats = await query(bookingStatsQuery, [userId]);
+
+    // Get recent properties (last 5)
+    const recentPropertiesQuery = `
+      SELECT ap.id, ap.property_type, ap.unit_type, ap.address, ap.price, 
+             ap.approval_status, ap.is_active, ap.views_count, ap.created_at,
+             ap.images, ap.amenities, ap.facilities
+      FROM all_properties ap
+      WHERE ap.user_id = ?
+      ORDER BY ap.created_at DESC
+      LIMIT 5
+    `;
+
+    const recentProperties = await query(recentPropertiesQuery, [userId]);
+
+    // Get recent bookings
+    const recentBookingsQuery = `
+      SELECT br.id, br.first_name, br.last_name, br.status, 
+             br.check_in_date, br.check_out_date, br.total_price, 
+             br.advance_amount, br.created_at,
+             ap.property_type, ap.address as property_address
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      WHERE ap.user_id = ?
+      ORDER BY br.created_at DESC
+      LIMIT 5
+    `;
+
+    const recentBookings = await query(recentBookingsQuery, [userId]);
+
+    // Process properties data
+    const processedProperties = recentProperties.map(property => {
+      const processedProperty = { ...property };
+      
+      try {
+        processedProperty.images = property.images ? JSON.parse(property.images) : [];
+      } catch (e) {
+        processedProperty.images = [];
+      }
+      
+      try {
+        processedProperty.amenities = property.amenities ? JSON.parse(property.amenities) : {};
+      } catch (e) {
+        processedProperty.amenities = {};
+      }
+      
+      try {
+        processedProperty.facilities = property.facilities ? JSON.parse(property.facilities) : {};
+      } catch (e) {
+        processedProperty.facilities = {};
+      }
+      
+      return processedProperty;
+    });
+
+    res.json({
+      stats: {
+        property_stats: propertyStats[0],
+        booking_stats: bookingStats[0]
+      },
+      recent_properties: processedProperties,
+      recent_bookings: recentBookings,
+      last_updated: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error fetching owner dashboard:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch dashboard data. Please try again.'
     });
   }
 });

@@ -30,7 +30,7 @@ router.get('/', auth, async (req, res) => {
 
     const profileQuery = `
       SELECT 
-        phone, profile_image, first_name, last_name, gender, birthdate, nationality,
+        phone, profile_image, first_name, last_name, gender, birthdate, nationality, identification_number,
         business_name, contact_person, business_type, business_registration, business_address,
         department, admin_level, created_at as profile_created, updated_at as profile_updated
       FROM user_profiles 
@@ -58,6 +58,7 @@ router.get('/', auth, async (req, res) => {
         gender: profile.gender,
         birthdate: profile.birthdate,
         nationality: profile.nationality,
+        identification_number: profile.identification_number,
         business_name: profile.business_name,
         contact_person: profile.contact_person,
         business_type: profile.business_type,
@@ -225,7 +226,7 @@ router.put('/', auth, async (req, res) => {
 
     const updatedProfile = await query(
       `SELECT 
-        phone, profile_image, first_name, last_name, gender, birthdate, nationality,
+        phone, profile_image, first_name, last_name, gender, birthdate, nationality, identification_number,
         business_name, contact_person, business_type, business_registration, business_address,
         department, admin_level, updated_at as profile_updated
       FROM user_profiles WHERE user_id = ?`,
