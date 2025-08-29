@@ -269,7 +269,7 @@ router.get('/public', async (req, res) => {
 
 /**
  * GET /api/properties/public/:id
- * Get a single public property by ID
+ * Get a single public property by ID with owner information
  */
 router.get('/public/:id', optionalAuth, async (req, res) => {
   const propertyId = req.params.id;
@@ -282,10 +282,22 @@ router.get('/public/:id', optionalAuth, async (req, res) => {
   }
 
   try {
-    const properties = await query(
-      'SELECT * FROM all_properties WHERE id = ? AND approval_status = ? AND is_active = ?',
-      [propertyId, 'approved', 1]
-    );
+    const propertyQuery = `
+      SELECT 
+        p.*,
+        u.username as owner_name,
+        u.email as owner_email,
+        up.business_name as owner_business_name,
+        up.phone as owner_phone,
+        up.first_name as owner_first_name,
+        up.last_name as owner_last_name
+      FROM all_properties p
+      LEFT JOIN users u ON p.user_id = u.id
+      LEFT JOIN user_profiles up ON u.id = up.user_id
+      WHERE p.id = ? AND p.approval_status = ? AND p.is_active = ?
+    `;
+
+    const properties = await query(propertyQuery, [propertyId, 'approved', 1]);
 
     if (properties.length === 0) {
       return res.status(404).json({
@@ -295,7 +307,25 @@ router.get('/public/:id', optionalAuth, async (req, res) => {
     }
 
     const property = properties[0];
-    const processedProperty = processPropertyData(property);
+    const processedProperty = {
+      ...processPropertyData(property),
+      owner_info: {
+        username: property.owner_name,
+        email: property.owner_email,
+        business_name: property.owner_business_name,
+        phone: property.owner_phone,
+        first_name: property.owner_first_name,
+        last_name: property.owner_last_name
+      }
+    };
+
+    // Clean up temporary fields
+    delete processedProperty.owner_name;
+    delete processedProperty.owner_email;
+    delete processedProperty.owner_business_name;
+    delete processedProperty.owner_phone;
+    delete processedProperty.owner_first_name;
+    delete processedProperty.owner_last_name;
 
     // Increment views count
     try {
