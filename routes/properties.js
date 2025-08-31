@@ -6,13 +6,41 @@ const dayjs = require('dayjs');
 const multer = require('multer');
 const path = require('path');
 
-const safeJsonParse = (str) => {
-  try {
-    return typeof str === 'string' ? JSON.parse(str) : str;
-  } catch (error) {
-    console.warn('Error parsing JSON:', error);
-    return str || [];
+const safeJsonParse = (value) => {
+  if (!value) return [];
+  
+  // If already an array, return it
+  if (Array.isArray(value)) return value;
+  
+  // If it's a string, try to parse as JSON first
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      
+      // If parsed is an object (like {"Parking": 1, "Pool": 1}), extract keys
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        return Object.keys(parsed).filter(key => parsed[key] > 0);
+      }
+      
+      // If parsed is an array, return it
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+      
+      // If single value, wrap in array
+      return [parsed];
+    } catch (error) {
+      // If JSON parsing fails, treat as comma-separated string
+      return value.split(',').map(item => item.trim()).filter(item => item.length > 0);
+    }
   }
+  
+  // If it's already an object, extract keys where value > 0
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    return Object.keys(value).filter(key => value[key] > 0);
+  }
+  
+  return [];
 };
 
 const processPropertyData = (property) => {
