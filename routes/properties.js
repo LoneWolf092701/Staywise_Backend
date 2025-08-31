@@ -217,21 +217,27 @@ router.get('/public', async (req, res) => {
 
     // Amenities filter
     if (amenities) {
-      const amenitiesList = amenities.split(',');
-      for (const amenity of amenitiesList) {
-        whereClause += ' AND JSON_EXTRACT(amenities, ?) IS NOT NULL';
-        queryParams.push(`$.${amenity.trim()}`);
-      }
-    }
+  const amenitiesList = amenities.split(',');
+  for (const amenity of amenitiesList) {
+    const trimmedAmenity = amenity.trim();
+    // Use JSON_CONTAINS for better JSON handling
+    whereClause += ' AND (JSON_CONTAINS(JSON_KEYS(amenities), JSON_QUOTE(?)) OR amenities LIKE ?)';
+    queryParams.push(trimmedAmenity);
+    queryParams.push(`%"${trimmedAmenity}"%`);
+  }
+}
 
     // Facilities filter
     if (facilities) {
-      const facilitiesList = facilities.split(',');
-      for (const facility of facilitiesList) {
-        whereClause += ' AND JSON_EXTRACT(facilities, ?) IS NOT NULL';
-        queryParams.push(`$.${facility.trim()}`);
-      }
-    }
+  const facilitiesList = facilities.split(',');
+  for (const facility of facilitiesList) {
+    const trimmedFacility = facility.trim();
+    // Use JSON_CONTAINS for better JSON handling
+    whereClause += ' AND (JSON_CONTAINS(JSON_KEYS(facilities), JSON_QUOTE(?)) OR facilities LIKE ?)';
+    queryParams.push(trimmedFacility);
+    queryParams.push(`%"${trimmedFacility}"%`);
+  }
+}
 
     // Get total count for pagination
     const countQuery = `SELECT COUNT(*) as total FROM all_properties ${whereClause}`;

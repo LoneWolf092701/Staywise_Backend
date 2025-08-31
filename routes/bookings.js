@@ -351,6 +351,79 @@ router.get('/owner', auth, requirePropertyOwner, async (req, res) => {
 });
 
 /**
+ * GET /api/bookings/user  
+ * Get user's booking requests (matches frontend API call)
+ */
+router.get('/user', auth, async (req, res) => {
+  const userId = req.user.id;
+  const page = parseInt(req.query.page) || 1;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+  const offset = (page - 1) * limit;
+  const status = req.query.status;
+
+  try {
+    let whereClause = 'WHERE br.user_id = ?';
+    let queryParams = [userId];
+
+    if (status && status !== 'all' && ['pending', 'approved', 'payment_submitted', 'confirmed', 'rejected', 'cancelled'].includes(status)) {
+      whereClause += ' AND br.status = ?';
+      queryParams.push(status);
+    }
+
+    const countQuery = `SELECT COUNT(*) as total FROM booking_requests br ${whereClause}`;
+    const countResult = await query(countQuery, queryParams);
+    const totalBookings = countResult[0].total;
+
+    const bookingsQuery = `
+      SELECT 
+        br.*,
+        ap.property_type, ap.unit_type, ap.address as property_address, ap.price,
+        ap.images, ap.amenities, ap.facilities, ap.description,
+        u.username as owner_username, u.email as owner_email
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      INNER JOIN users u ON br.property_owner_id = u.id
+      ${whereClause}
+      ORDER BY br.created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+    queryParams.push(limit, offset);
+
+    const bookings = await query(bookingsQuery, queryParams);
+
+    const processedBookings = bookings.map(booking => ({
+      ...booking,
+      images: safeJsonParse(booking.images),
+      amenities: safeJsonParse(booking.amenities),
+      facilities: safeJsonParse(booking.facilities),
+      price: parseFloat(booking.price),
+      total_price: parseFloat(booking.total_price),
+      advance_amount: parseFloat(booking.advance_amount),
+      service_fee: parseFloat(booking.service_fee || 0)
+    }));
+
+    res.json({
+      bookings: processedBookings,
+      pagination: {
+        page: page,
+        limit: limit,
+        total: totalBookings,
+        totalPages: Math.ceil(totalBookings / limit),
+        hasNext: page < Math.ceil(totalBookings / limit),
+        hasPrevious: page > 1
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching user bookings:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch bookings. Please try again.'
+    });
+  }
+});
+
+/**
  * GET /api/bookings/:id
  * Get specific booking details
  */
