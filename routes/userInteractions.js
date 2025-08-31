@@ -78,12 +78,13 @@ router.post('/view', optionalAuth, async (req, res) => {
 
 /**
  * POST /api/user-interactions/favorite
- * Toggle favorite status for a property
+ * Toggle favorite status for a property (optimized version)
  */
 router.post('/favorite', auth, async (req, res) => {
   const { property_id } = req.body;
   const user_id = req.user.id;
 
+  // Validate input
   if (!property_id || isNaN(property_id)) {
     return res.status(400).json({ 
       error: 'Valid Property ID is required' 
@@ -91,47 +92,71 @@ router.post('/favorite', auth, async (req, res) => {
   }
 
   try {
-    // Check if property exists and is active
-    const propertyExists = await query(
-      'SELECT id FROM all_properties WHERE id = ? AND is_active = 1',
-      [property_id]
+    // Check if property exists and is active in one query
+    const propertyCheck = await query(
+      `SELECT 
+        ap.id,
+        ap.property_type,
+        ap.unit_type,
+        ap.is_active,
+        ap.approval_status,
+        ui.id as favorite_id
+      FROM all_properties ap
+      LEFT JOIN user_interactions ui ON (ap.id = ui.property_id AND ui.user_id = ? AND ui.interaction_type = ?)
+      WHERE ap.id = ?`,
+      [user_id, 'favorite', property_id]
     );
 
-    if (propertyExists.length === 0) {
+    if (propertyCheck.length === 0) {
       return res.status(404).json({ 
-        error: 'Property not found or not active' 
+        error: 'Property not found'
       });
     }
 
-    // Check if user has already favorited this property
-    const existingFavorite = await query(
-      'SELECT id FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
-      [user_id, property_id, 'favorite']
-    );
+    const property = propertyCheck[0];
 
-    if (existingFavorite.length > 0) {
+    // Check if property is active and approved
+    if (property.is_active !== 1 || property.approval_status !== 'approved') {
+      return res.status(400).json({ 
+        error: 'Property is not available for favoriting'
+      });
+    }
+
+    const existingFavorite = property.favorite_id;
+
+    if (existingFavorite) {
       // Remove from favorites
       await query(
-        'DELETE FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
-        [user_id, property_id, 'favorite']
+        'DELETE FROM user_interactions WHERE id = ?',
+        [existingFavorite]
       );
 
       res.json({
-        message: 'Property removed from favorites',
+        message: 'Property removed from favorites successfully',
         action: 'removed',
-        property_id: parseInt(property_id)
+        property_id: parseInt(property_id),
+        property_info: {
+          type: property.property_type,
+          unit_type: property.unit_type
+        }
       });
     } else {
       // Add to favorites
       await query(
-        'INSERT INTO user_interactions (user_id, property_id, interaction_type, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())',
+        `INSERT INTO user_interactions 
+         (user_id, property_id, interaction_type, created_at, updated_at) 
+         VALUES (?, ?, ?, NOW(), NOW())`,
         [user_id, property_id, 'favorite']
       );
 
       res.json({
-        message: 'Property added to favorites',
+        message: 'Property added to favorites successfully',
         action: 'added',
-        property_id: parseInt(property_id)
+        property_id: parseInt(property_id),
+        property_info: {
+          type: property.property_type,
+          unit_type: property.unit_type
+        }
       });
     }
 
@@ -139,14 +164,14 @@ router.post('/favorite', auth, async (req, res) => {
     console.error('Error managing favorite:', error);
     res.status(500).json({ 
       error: 'Database error',
-      message: 'Unable to manage favorite. Please try again.'
+      message: 'Unable to manage favorite status. Please try again.'
     });
   }
 });
 
 /**
  * GET /api/user-interactions/favorite/:property_id
- * Check if property is favorited by current user
+ * Check if property is favorited by current user (optimized)
  */
 router.get('/favorite/:property_id', auth, async (req, res) => {
   const property_id = req.params.property_id;
@@ -159,14 +184,30 @@ router.get('/favorite/:property_id', auth, async (req, res) => {
   }
 
   try {
-    const favorite = await query(
-      'SELECT id FROM user_interactions WHERE user_id = ? AND property_id = ? AND interaction_type = ?',
-      [user_id, property_id, 'favorite']
+    const favoriteCheck = await query(
+      `SELECT ui.id as favorite_id, ap.property_type, ap.unit_type
+       FROM all_properties ap
+       LEFT JOIN user_interactions ui ON (ap.id = ui.property_id AND ui.user_id = ? AND ui.interaction_type = ?)
+       WHERE ap.id = ?`,
+      [user_id, 'favorite', property_id]
     );
 
+    if (favoriteCheck.length === 0) {
+      return res.status(404).json({ 
+        error: 'Property not found' 
+      });
+    }
+
+    const result = favoriteCheck[0];
+    const isFavorited = result.favorite_id !== null;
+
     res.json({
-      is_favorited: favorite.length > 0,
-      property_id: parseInt(property_id)
+      is_favorited: isFavorited,
+      property_id: parseInt(property_id),
+      property_info: {
+        type: result.property_type,
+        unit_type: result.unit_type
+      }
     });
 
   } catch (error) {
@@ -624,7 +665,7 @@ router.post('/complaint', auth, async (req, res) => {
 
 /**
  * GET /api/user-interactions/favorites
- * Get user's favorite properties
+ * Get user's favorite properties (MINIMAL FIX - using original working structure)
  */
 router.get('/favorites', auth, async (req, res) => {
   const user_id = req.user.id;
@@ -642,9 +683,12 @@ router.get('/favorites', auth, async (req, res) => {
     const countResult = await query(countQuery, [user_id, 'favorite', 'approved']);
     const totalFavorites = countResult[0].total;
 
+    // Use the ORIGINAL working query structure - just add property_id alias
     const favoritesQuery = `
       SELECT 
-        ap.id, ap.property_type, ap.unit_type, ap.address, ap.price, 
+        ap.id, 
+        ap.id as property_id,
+        ap.property_type, ap.unit_type, ap.address, ap.price, 
         ap.amenities, ap.facilities, ap.images, ap.description, 
         ap.bedrooms, ap.bathrooms, ap.available_from, ap.available_to,
         ap.views_count, ap.created_at as property_created,
@@ -660,31 +704,24 @@ router.get('/favorites', auth, async (req, res) => {
 
     const favorites = await query(favoritesQuery, [user_id, 'favorite', 'approved', limit, offset]);
 
-    const processedFavorites = favorites.map(fav => ({
-      ...fav,
-      amenities: safeJsonParse(fav.amenities),
-      facilities: safeJsonParse(fav.facilities),
-      images: safeJsonParse(fav.images),
-      price: parseFloat(fav.price)
-    }));
-
     res.json({
-      favorites: processedFavorites,
+      message: 'Favorite properties retrieved successfully',
+      favorites: favorites,
       pagination: {
-        page: page,
-        limit: limit,
-        total: totalFavorites,
-        totalPages: Math.ceil(totalFavorites / limit),
-        hasNext: page < Math.ceil(totalFavorites / limit),
-        hasPrevious: page > 1
+        current_page: page,
+        total_pages: Math.ceil(totalFavorites / limit),
+        total_items: totalFavorites,
+        items_per_page: limit,
+        has_next: page < Math.ceil(totalFavorites / limit),
+        has_prev: page > 1
       }
     });
 
   } catch (error) {
-    console.error('Error fetching favorites:', error);
+    console.error('Error fetching user favorites:', error);
     res.status(500).json({ 
       error: 'Database error',
-      message: 'Unable to fetch favorites. Please try again.'
+      message: 'Unable to fetch favorite properties. Please try again.'
     });
   }
 });
