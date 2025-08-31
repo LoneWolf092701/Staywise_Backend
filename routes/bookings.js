@@ -7,7 +7,7 @@ const { createNotification } = require('./notifications');
 /**
  * Safe JSON parsing function that handles both JSON and comma-separated string formats
  * This ensures booking operations can display property information regardless of storage format
- * @param {string|null} value - The value to parse (JSON string or comma-separated string)
+ * @param {string|object|array|null} value - The value to parse
  * @returns {Array} Array of parsed values
  */
 const safeJsonParse = (value) => {
@@ -16,12 +16,29 @@ const safeJsonParse = (value) => {
   // If already an array, return it
   if (Array.isArray(value)) return value;
   
+  // If it's an object, extract keys where value > 0 (for amenities format)
+  if (typeof value === 'object' && value !== null) {
+    return Object.keys(value).filter(key => value[key] > 0);
+  }
+  
   // If it's a string, try to parse as JSON first
   if (typeof value === 'string') {
     // Try JSON parsing first
     try {
       const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
+      
+      // If parsed is an object (like {"Parking": 1, "Pool": 1}), extract keys where value > 0
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        return Object.keys(parsed).filter(key => parsed[key] > 0);
+      }
+      
+      // If parsed is an array, return it
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+      
+      // If single value, wrap in array
+      return [parsed];
     } catch (error) {
       // If JSON parsing fails, treat as comma-separated string
       return value.split(',').map(item => item.trim()).filter(item => item.length > 0);
