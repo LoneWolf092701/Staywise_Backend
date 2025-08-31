@@ -61,7 +61,7 @@ const isDevelopment = process.env.NODE_ENV === 'development';
 // General rate limiter - more lenient for development
 const limiter = rateLimit({
   windowMs: 15 * 60 * 10000, // 15 minutes
-  max: isDevelopment ? 10000 : 1000, // 1000 requests for dev, 100 for production
+  max: isDevelopment ? 100000 : 10000, // 1000 requests for dev, 100 for production
   message: {
     error: 'Too many requests',
     message: 'Too many requests from this IP, please try again later.',
