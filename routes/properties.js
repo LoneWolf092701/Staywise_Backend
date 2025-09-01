@@ -44,15 +44,59 @@ const safeJsonParse = (value) => {
 };
 
 const processPropertyData = (property) => {
+  if (!property) return property;
+
+  // Parse facilities properly to handle count extraction
+  let parsedFacilities = {};
+  if (property.facilities) {
+    try {
+      parsedFacilities = typeof property.facilities === 'string' 
+        ? JSON.parse(property.facilities) 
+        : property.facilities;
+    } catch (e) {
+      console.warn('Invalid facilities JSON:', property.facilities);
+      parsedFacilities = {};
+    }
+  }
+
+  // Normalize facility counts - handle both singular and plural forms
+  const normalizedFacilities = {};
+  Object.entries(parsedFacilities).forEach(([key, value]) => {
+    const normalizedKey = key.toLowerCase();
+    let count = 0;
+    
+    if (typeof value === 'object' && value !== null) {
+      count = 1; // If it's an object, count as 1
+    } else if (typeof value === 'number') {
+      count = value;
+    } else if (typeof value === 'string') {
+      const numValue = parseInt(value);
+      count = isNaN(numValue) ? (value ? 1 : 0) : numValue;
+    } else {
+      count = value ? 1 : 0;
+    }
+
+    // Normalize plural/singular forms
+    if (normalizedKey.includes('bedroom')) {
+      normalizedFacilities['bedroom'] = count;
+      normalizedFacilities['bedrooms'] = count;
+    } else if (normalizedKey.includes('bathroom')) {
+      normalizedFacilities['bathroom'] = count;
+      normalizedFacilities['bathrooms'] = count;
+    } else {
+      normalizedFacilities[key] = count;
+    }
+  });
+
   return {
     ...property,
-    price: parseFloat(property.price),
+    price: parseFloat(property.price) || 0,
     amenities: safeJsonParse(property.amenities),
-    facilities: safeJsonParse(property.facilities),
+    facilities: normalizedFacilities,
     images: safeJsonParse(property.images),
-    rules: safeJsonParse(property.rules),
-    roommates: safeJsonParse(property.roommates),
-    bills_inclusive: safeJsonParse(property.bills_inclusive)
+    latitude: property.latitude ? parseFloat(property.latitude) : null,
+    longitude: property.longitude ? parseFloat(property.longitude) : null,
+    views_count: parseInt(property.views_count) || 0,
   };
 };
 
@@ -715,6 +759,74 @@ router.get('/owner/mine', auth, requirePropertyOwner, async (req, res) => {
     res.status(500).json({
       error: 'Database error',
       message: 'Unable to fetch properties. Please try again.'
+    });
+  }
+});
+
+router.get('/owner/:id', auth, requirePropertyOwner, async (req, res) => {
+  const propertyId = req.params.id;
+  const userId = req.user.id;
+
+  if (!propertyId || isNaN(propertyId)) {
+    return res.status(400).json({
+      error: 'Invalid property ID',
+      message: 'Property ID must be a valid number'
+    });
+  }
+
+  try {
+    const propertyQuery = `
+      SELECT 
+        p.*,
+        u.username as owner_name,
+        u.email as owner_email,
+        up.business_name as owner_business_name,
+        up.phone as owner_phone,
+        up.first_name as owner_first_name,
+        up.last_name as owner_last_name
+      FROM all_properties p
+      LEFT JOIN users u ON p.user_id = u.id
+      LEFT JOIN user_profiles up ON u.id = up.user_id
+      WHERE p.id = ? AND p.user_id = ?
+    `;
+
+    const properties = await query(propertyQuery, [propertyId, userId]);
+
+    if (properties.length === 0) {
+      return res.status(404).json({
+        error: 'Property not found',
+        message: 'The requested property could not be found or you do not have access to it'
+      });
+    }
+
+    const property = properties[0];
+    const processedProperty = {
+      ...processPropertyData(property),
+      owner_info: {
+        username: property.owner_name,
+        email: property.owner_email,
+        business_name: property.owner_business_name,
+        phone: property.owner_phone,
+        first_name: property.owner_first_name,
+        last_name: property.owner_last_name
+      }
+    };
+
+    // Clean up temporary fields
+    delete processedProperty.owner_name;
+    delete processedProperty.owner_email;
+    delete processedProperty.owner_business_name;
+    delete processedProperty.owner_phone;
+    delete processedProperty.owner_first_name;
+    delete processedProperty.owner_last_name;
+
+    res.json(processedProperty);
+
+  } catch (error) {
+    console.error('Error fetching owner property:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch property. Please try again.'
     });
   }
 });
