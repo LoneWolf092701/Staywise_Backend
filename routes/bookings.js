@@ -3,6 +3,11 @@ const router = express.Router();
 const { query, executeTransaction } = require('../config/db');
 const { auth, requireUser, requirePropertyOwner } = require('../middleware/auth');
 const { createNotification } = require('./notifications');
+const { 
+  upload, 
+  processFileUpload, 
+  uploadMultipleFiles 
+} = require('../middleware/upload');
 
 /**
  * Safe JSON parsing function that handles both JSON and comma-separated string formats
@@ -810,5 +815,595 @@ router.get('/user/stats', auth, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch booking stats' });
   }
 });
+
+/**
+ * POST /api/bookings/:id/owner-response
+ * Handle owner response with account number (added for booking flow)
+ */
+router.post('/:id/owner-response', auth, requirePropertyOwner, async (req, res) => {
+  const bookingId = req.params.id;
+  const { action, account_number, message } = req.body;
+  const ownerId = req.user.id;
+
+  if (!action || !['approve', 'reject'].includes(action)) {
+    return res.status(400).json({
+      error: 'Invalid action',
+      message: 'Action must be approve or reject'
+    });
+  }
+
+  try {
+    // Verify booking belongs to owner
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND property_owner_id = ?',
+      [bookingId, ownerId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        error: 'Booking not found or access denied'
+      });
+    }
+
+    if (booking[0].status !== 'pending') {
+      return res.status(400).json({
+        error: 'Booking is no longer pending'
+      });
+    }
+
+    const newStatus = action === 'approve' ? 'approved' : 'rejected';
+    const responseMessage = message || (action === 'approve' ? 'Booking approved' : 'Booking rejected');
+
+    // Update booking status and account info
+    await query(
+      `UPDATE booking_requests 
+       SET status = ?, owner_response_message = ?, payment_account_info = ?, owner_responded_at = NOW() 
+       WHERE id = ?`,
+      [newStatus, responseMessage, account_number || null, bookingId]
+    );
+
+    // Get user phone for WhatsApp notification
+    const userProfile = await query(
+      'SELECT up.phone_number FROM users u LEFT JOIN user_profiles up ON u.id = up.user_id WHERE u.id = ?',
+      [booking[0].user_id]
+    );
+
+    // Create notification for user
+    const notificationType = action === 'approve' ? 'booking_approved_payment' : 'booking_response';
+    const notificationTitle = action === 'approve' ? 'Booking Approved - Payment Required' : 'Booking Rejected';
+    const notificationMessage = action === 'approve' 
+      ? `Your booking has been approved. Account number: ${account_number}. Please complete payment.`
+      : `Your booking has been rejected. ${responseMessage}`;
+
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        booking[0].user_id,
+        notificationType,
+        notificationTitle,
+        notificationMessage,
+        bookingId,
+        ownerId,
+        JSON.stringify({ account_number: account_number || null, action })
+      ]
+    );
+
+    res.json({
+      message: `Booking ${action}d successfully`,
+      booking_id: bookingId,
+      status: newStatus
+    });
+
+  } catch (error) {
+    console.error('Error processing owner response:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to process response. Please try again.'
+    });
+  }
+});
+
+/**
+ * POST /api/bookings/:id/upload-receipt
+ * Handle receipt and NIC photo upload (added for booking flow)
+ */
+router.post('/:id/upload-receipt', auth, upload.fields([
+  { name: 'receipt', maxCount: 1 },
+  { name: 'nic', maxCount: 1 }
+]), async (req, res) => {
+  const bookingId = req.params.id;
+  const userId = req.user.id;
+
+  try {
+    // Verify booking belongs to user and is approved
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND user_id = ?',
+      [bookingId, userId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        error: 'Booking not found'
+      });
+    }
+
+    if (booking[0].status !== 'approved') {
+      return res.status(400).json({
+        error: 'Booking must be approved for payment submission'
+      });
+    }
+
+    if (!req.files || !req.files.receipt || !req.files.nic) {
+      return res.status(400).json({
+        error: 'Both receipt and NIC photo are required'
+      });
+    }
+
+    const receiptUrl = `/uploads/${req.files.receipt[0].filename}`;
+    const nicUrl = `/uploads/${req.files.nic[0].filename}`;
+
+    // Update booking with receipt and NIC
+    await query(
+      `UPDATE booking_requests 
+       SET payment_proof_url = ?, verification_document_url = ?, 
+           verification_document_type = 'nic', payment_method = 'receipt_upload',
+           status = 'payment_submitted', payment_submitted_at = NOW()
+       WHERE id = ?`,
+      [receiptUrl, nicUrl, bookingId]
+    );
+
+    // Notify owner about receipt submission
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
+       VALUES (?, 'payment_submitted', 'Payment Receipt Submitted', 
+               'A tenant has submitted payment receipt and NIC for review.', ?, ?, ?)`,
+      [
+        booking[0].property_owner_id,
+        bookingId,
+        userId,
+        JSON.stringify({ receipt_url: receiptUrl, nic_url: nicUrl })
+      ]
+    );
+
+    res.json({
+      message: 'Payment receipt and NIC uploaded successfully',
+      status: 'payment_submitted'
+    });
+
+  } catch (error) {
+    console.error('Error uploading receipt:', error);
+    res.status(500).json({
+      error: 'Upload failed',
+      message: 'Unable to upload documents. Please try again.'
+    });
+  }
+});
+
+/**
+ * POST /api/bookings/:id/stripe-payment
+ * Handle Stripe payment confirmation (added for booking flow)
+ */
+router.post('/:id/stripe-payment', auth, async (req, res) => {
+  const bookingId = req.params.id;
+  const userId = req.user.id;
+  const { payment_intent_id, payment_method_id } = req.body;
+
+  try {
+    // Verify booking belongs to user and is approved
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND user_id = ?',
+      [bookingId, userId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        error: 'Booking not found'
+      });
+    }
+
+    if (booking[0].status !== 'approved') {
+      return res.status(400).json({
+        error: 'Booking must be approved for payment'
+      });
+    }
+
+    // Update booking with Stripe payment info
+    await query(
+      `UPDATE booking_requests 
+       SET stripe_payment_intent_id = ?, stripe_payment_method_id = ?,
+           payment_method = 'stripe', status = 'payment_submitted', payment_submitted_at = NOW()
+       WHERE id = ?`,
+      [payment_intent_id, payment_method_id, bookingId]
+    );
+
+    // Notify owner about Stripe payment
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
+       VALUES (?, 'payment_submitted', 'Stripe Payment Received', 
+               'A tenant has completed payment via Stripe for their booking.', ?, ?, ?)`,
+      [
+        booking[0].property_owner_id,
+        bookingId,
+        userId,
+        JSON.stringify({ payment_intent_id, payment_method_id })
+      ]
+    );
+
+    res.json({
+      message: 'Stripe payment processed successfully',
+      status: 'payment_submitted'
+    });
+
+  } catch (error) {
+    console.error('Error processing Stripe payment:', error);
+    res.status(500).json({
+      error: 'Payment processing failed',
+      message: 'Unable to process payment. Please try again.'
+    });
+  }
+});
+
+/**
+ * POST /api/bookings/:id/confirm-booking
+ * Owner confirms booking after payment review (added for booking flow)
+ */
+router.post('/:id/confirm-booking', auth, requirePropertyOwner, async (req, res) => {
+  const bookingId = req.params.id;
+  const ownerId = req.user.id;
+  const { action, message } = req.body; // action: 'approve' or 'reject'
+
+  if (!action || !['approve', 'reject'].includes(action)) {
+    return res.status(400).json({
+      error: 'Invalid action',
+      message: 'Action must be approve or reject'
+    });
+  }
+
+  try {
+    // Verify booking belongs to owner and payment is submitted
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND property_owner_id = ?',
+      [bookingId, ownerId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        error: 'Booking not found or access denied'
+      });
+    }
+
+    if (booking[0].status !== 'payment_submitted') {
+      return res.status(400).json({
+        error: 'Booking must have payment submitted for confirmation'
+      });
+    }
+
+    const newStatus = action === 'approve' ? 'confirmed' : 'payment_rejected';
+    const responseMessage = message || (action === 'approve' ? 'Payment approved, booking confirmed' : 'Payment rejected');
+
+    // Update booking status
+    await query(
+      `UPDATE booking_requests 
+       SET status = ?, owner_response_message = ?, payment_confirmed_at = NOW()
+       WHERE id = ?`,
+      [newStatus, responseMessage, bookingId]
+    );
+
+    // Notify user about confirmation
+    const notificationTitle = action === 'approve' ? 'Booking Confirmed!' : 'Payment Rejected';
+    const notificationMessage = action === 'approve' 
+      ? 'Your payment has been approved and booking is confirmed!'
+      : `Your payment was rejected. ${responseMessage}`;
+
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
+       VALUES (?, 'booking_confirmed', ?, ?, ?, ?, ?)`,
+      [
+        booking[0].user_id,
+        notificationTitle,
+        notificationMessage,
+        bookingId,
+        ownerId,
+        JSON.stringify({ final_status: newStatus })
+      ]
+    );
+
+    res.json({
+      message: `Booking ${action === 'approve' ? 'confirmed' : 'payment rejected'} successfully`,
+      booking_id: bookingId,
+      status: newStatus
+    });
+
+  } catch (error) {
+    console.error('Error confirming booking:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to confirm booking. Please try again.'
+    });
+  }
+});
+
+router.put('/:bookingId/respond', auth, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { action, message = '', account_info = '' } = req.body;
+    const ownerId = req.user.id;
+
+    // Validate action
+    if (!['approved', 'rejected'].includes(action)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid action',
+        message: 'Action must be either "approved" or "rejected"'
+      });
+    }
+
+    // Get booking and validate owner
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND property_owner_id = ?',
+      [bookingId, ownerId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found',
+        message: 'Booking not found or access denied'
+      });
+    }
+
+    const bookingData = booking[0];
+
+    // Update booking status and add account info
+    const newStatus = action === 'approved' ? 'approved' : 'rejected';
+    await query(
+      'UPDATE booking_requests SET status = ?, owner_response_message = ?, payment_account_info = ?, owner_responded_at = NOW() WHERE id = ?',
+      [newStatus, message, account_info, bookingId]
+    );
+
+    if (action === 'approved') {
+      // Create notification for user with account info
+      await query(
+        `INSERT INTO notifications (user_id, type, title, message, data, booking_id, property_id, from_user_id) 
+         VALUES (?, 'booking_approved_payment', 'Booking Approved - Payment Required', 
+         'Your booking has been approved! Please proceed with payment using the provided account details.', 
+         ?, ?, ?, ?)`,
+        [
+          bookingData.user_id,
+          JSON.stringify({
+            booking_id: bookingId,
+            account_info: account_info,
+            amount: bookingData.advance_amount,
+            property_address: bookingData.property_address || ''
+          }),
+          bookingId,
+          bookingData.property_id,
+          ownerId
+        ]
+      );
+    } else {
+      // Create rejection notification
+      await query(
+        `INSERT INTO notifications (user_id, type, title, message, data, booking_id, property_id, from_user_id) 
+         VALUES (?, 'booking_response', 'Booking Rejected', ?, ?, ?, ?, ?)`,
+        [
+          bookingData.user_id,
+          `Your booking request has been rejected. ${message}`,
+          JSON.stringify({ action: 'rejected', reason: message }),
+          bookingId,
+          bookingData.property_id,
+          ownerId
+        ]
+      );
+    }
+
+    res.json({
+      success: true,
+      message: `Booking ${action} successfully`,
+      booking: bookingData
+    });
+
+  } catch (error) {
+    console.error('Error responding to booking:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error',
+      message: 'Failed to respond to booking request'
+    });
+  }
+});
+
+router.post('/:bookingId/payment-receipt', auth, upload.fields([
+  { name: 'payment_receipt', maxCount: 1 },
+  { name: 'nic_document', maxCount: 1 }
+]), processFileUpload, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const userId = req.user.id;
+
+    // Validate booking belongs to user and is approved
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND user_id = ? AND status = "approved"',
+      [bookingId, userId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found',
+        message: 'Booking not found or not approved for payment'
+      });
+    }
+
+    const bookingData = booking[0];
+
+    if (!req.uploadedFiles?.payment_receipt?.[0] || !req.uploadedFiles?.nic_document?.[0]) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing files',
+        message: 'Both payment receipt and NIC document are required'
+      });
+    }
+
+    const receiptFile = req.uploadedFiles.payment_receipt[0];
+    const nicFile = req.uploadedFiles.nic_document[0];
+
+    // Update booking with payment proof
+    await query(
+      `UPDATE booking_requests SET 
+       status = 'payment_submitted',
+       payment_proof_url = ?,
+       verification_document_url = ?,
+       verification_document_type = 'NIC',
+       payment_method = 'receipt_upload',
+       payment_submitted_at = NOW()
+       WHERE id = ?`,
+      [receiptFile.url, nicFile.url, bookingId]
+    );
+
+    // Notify property owner about payment submission
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, data, booking_id, property_id, from_user_id) 
+       VALUES (?, 'payment_submitted', 'Payment Receipt Submitted', 
+       'A tenant has submitted payment receipt and verification documents for your property booking.', 
+       ?, ?, ?, ?)`,
+      [
+        bookingData.property_owner_id,
+        JSON.stringify({
+          booking_id: bookingId,
+          tenant_name: `${bookingData.first_name} ${bookingData.last_name}`,
+          amount: bookingData.advance_amount,
+          receipt_url: receiptFile.url,
+          nic_url: nicFile.url
+        }),
+        bookingId,
+        bookingData.property_id,
+        userId
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: 'Payment receipt and documents uploaded successfully',
+      data: {
+        receipt_url: receiptFile.url,
+        nic_url: nicFile.url,
+        booking_status: 'payment_submitted'
+      }
+    });
+
+  } catch (error) {
+    console.error('Error uploading payment receipt:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Upload failed',
+      message: 'Failed to upload payment documents'
+    });
+  }
+});
+
+router.put('/:bookingId/confirm-payment', auth, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { action, message = '' } = req.body;
+    const ownerId = req.user.id;
+
+    if (!['approved', 'rejected'].includes(action)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid action',
+        message: 'Action must be "approved" or "rejected"'
+      });
+    }
+
+    // Get booking and validate
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND property_owner_id = ? AND status = "payment_submitted"',
+      [bookingId, ownerId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found',
+        message: 'Booking not found or payment not submitted'
+      });
+    }
+
+    const bookingData = booking[0];
+    const newStatus = action === 'approved' ? 'confirmed' : 'payment_rejected';
+
+    // Update booking status
+    await query(
+      'UPDATE booking_requests SET status = ?, payment_confirmed_at = NOW() WHERE id = ?',
+      [newStatus, bookingId]
+    );
+
+    // Notify user about payment confirmation
+    const notificationTitle = action === 'approved' ? 'Booking Confirmed!' : 'Payment Rejected';
+    const notificationMessage = action === 'approved' 
+      ? 'Your payment has been confirmed and your booking is now confirmed!'
+      : `Your payment has been rejected. ${message}`;
+
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, data, booking_id, property_id, from_user_id) 
+       VALUES (?, 'booking_confirmed', ?, ?, ?, ?, ?, ?)`,
+      [
+        bookingData.user_id,
+        notificationTitle,
+        notificationMessage,
+        JSON.stringify({ action, message }),
+        bookingId,
+        bookingData.property_id,
+        ownerId
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: `Payment ${action} successfully`,
+      booking_status: newStatus
+    });
+
+  } catch (error) {
+    console.error('Error confirming payment:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error',
+      message: 'Failed to confirm payment'
+    });
+  }
+});
+
+router.get('/property/:propertyId/status', auth, async (req, res) => {
+  try {
+    const { propertyId } = req.params;
+    
+    // Get active bookings for this property
+    const activeBookings = await query(
+      `SELECT id, user_id, check_in_date, check_out_date, status 
+       FROM booking_requests 
+       WHERE property_id = ? AND status IN ('confirmed', 'payment_submitted') 
+       AND check_out_date >= CURDATE()`,
+      [propertyId]
+    );
+
+    res.json({
+      success: true,
+      active_bookings: activeBookings,
+      is_available: activeBookings.length === 0
+    });
+
+  } catch (error) {
+    console.error('Error checking property status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error',
+      message: 'Failed to check property status'
+    });
+  }
+});
+
 
 module.exports = router;
