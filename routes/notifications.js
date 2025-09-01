@@ -545,4 +545,146 @@ router.delete('/:id', auth, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/notifications/whatsapp-notify
+ * Send WhatsApp notification using owner phone number (added for booking flow)
+ */
+router.post('/whatsapp-notify', auth, async (req, res) => {
+  const { booking_id, message_type, recipient_id } = req.body;
+
+  try {
+    // Get recipient profile with phone number
+    const recipientProfile = await query(`
+      SELECT u.id, u.username, up.phone_number, up.whatsapp_number
+      FROM users u 
+      LEFT JOIN user_profiles up ON u.id = up.user_id 
+      WHERE u.id = ?
+    `, [recipient_id]);
+
+    if (recipientProfile.length === 0) {
+      return res.status(404).json({
+        error: 'Recipient not found'
+      });
+    }
+
+    const profile = recipientProfile[0];
+    const whatsappNumber = profile.whatsapp_number || profile.phone_number;
+
+    if (!whatsappNumber) {
+      return res.status(400).json({
+        error: 'No phone number available for WhatsApp notification'
+      });
+    }
+
+    // Get booking details if booking_id provided
+    let bookingDetails = null;
+    if (booking_id) {
+      const booking = await query(
+        'SELECT * FROM booking_requests WHERE id = ?',
+        [booking_id]
+      );
+      bookingDetails = booking.length > 0 ? booking[0] : null;
+    }
+
+    // Format message based on type
+    let whatsappMessage = '';
+    switch (message_type) {
+      case 'booking_request':
+        whatsappMessage = `New booking request received. Please check your StayWise dashboard to respond.`;
+        break;
+      case 'booking_approved':
+        whatsappMessage = `Your booking has been approved! Account number has been provided. Please complete payment.`;
+        break;
+      case 'payment_submitted':
+        whatsappMessage = `Payment receipt has been submitted for your property booking. Please review and confirm.`;
+        break;
+      case 'booking_confirmed':
+        whatsappMessage = `Booking confirmed! Your payment has been approved.`;
+        break;
+      default:
+        whatsappMessage = `You have a new notification on StayWise.`;
+    }
+
+    // Here you would integrate with your WhatsApp API service
+    // For now, we'll simulate the notification
+    console.log(`WhatsApp notification to ${whatsappNumber}: ${whatsappMessage}`);
+
+    // Log the notification attempt
+    await query(`
+      INSERT INTO notification_logs (user_id, notification_type, phone_number, message, status, created_at)
+      VALUES (?, ?, ?, ?, 'sent', NOW())
+    `, [recipient_id, message_type, whatsappNumber, whatsappMessage]);
+
+    res.json({
+      message: 'WhatsApp notification sent successfully',
+      phone_number: whatsappNumber.replace(/.(?=.{4})/g, '*') // Partially mask phone number
+    });
+
+  } catch (error) {
+    console.error('Error sending WhatsApp notification:', error);
+    res.status(500).json({
+      error: 'Notification failed',
+      message: 'Unable to send WhatsApp notification'
+    });
+  }
+});
+
+/**
+ * GET /api/notifications/booking-notifications/:booking_id
+ * Get all notifications for a specific booking (added for booking flow)
+ */
+router.get('/booking-notifications/:booking_id', auth, async (req, res) => {
+  const bookingId = req.params.booking_id;
+  const userId = req.user.id;
+
+  try {
+    // Verify user has access to this booking
+    const booking = await query(
+      'SELECT user_id, property_owner_id FROM booking_requests WHERE id = ?',
+      [bookingId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        error: 'Booking not found'
+      });
+    }
+
+    const canAccess = booking[0].user_id === userId || 
+                     booking[0].property_owner_id === userId || 
+                     req.user.role === 'admin';
+
+    if (!canAccess) {
+      return res.status(403).json({
+        error: 'Access denied'
+      });
+    }
+
+    // Get all notifications for this booking
+    const notifications = await query(`
+      SELECT n.*, 
+             u.username as from_username
+      FROM notifications n
+      LEFT JOIN users u ON n.from_user_id = u.id
+      WHERE n.booking_id = ?
+      ORDER BY n.created_at DESC
+    `, [bookingId]);
+
+    res.json({
+      notifications: notifications.map(notification => ({
+        ...notification,
+        data: notification.data ? JSON.parse(notification.data) : null
+      }))
+    });
+
+  } catch (error) {
+    console.error('Error fetching booking notifications:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch notifications'
+    });
+  }
+});
+
+
 module.exports = { router, createNotification };
