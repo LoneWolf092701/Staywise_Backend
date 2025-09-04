@@ -23,51 +23,65 @@ const generateToken = (user) => {
   );
 };
 
-router.post('/register', async (req, res) => {
-  const { username, email, password, role, profile } = req.body;
+const VALID_EMPLOYEE_IDS = [
+  'EMP001', 'EMP002', 'EMP003', 'EMP004', 'EMP005',
+  'EMP006', 'EMP007', 'EMP008', 'EMP009', 'EMP010'
+];
 
-  if (!username || !email || !password) {
+router.post('/register', async (req, res) => {
+  const { username, email, password, role, profile = {} } = req.body;
+
+  if (!username || !email || !password || !role) {
     return res.status(400).json({
       error: 'Missing required fields',
-      message: 'Username, email, and password are required'
+      message: 'Username, email, password, and role are required'
     });
   }
 
-  if (username.trim().length < 3) {
-    return res.status(400).json({
-      error: 'Invalid username',
-      message: 'Username must be at least 3 characters long'
-    });
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json({
-      error: 'Invalid password',
-      message: 'Password must be at least 6 characters long'
-    });
-  }
-
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(email)) {
-    return res.status(400).json({
-      error: 'Invalid email',
-      message: 'Please enter a valid email address'
-    });
-  }
-
-  const validRoles = ['user', 'propertyowner', 'admin'];
-  const userRole = role || 'user';
+  const userRole = role.toLowerCase();
+  const allowedRoles = ['user', 'propertyowner', 'admin'];
   
-  if (!validRoles.includes(userRole)) {
+  if (!allowedRoles.includes(userRole)) {
     return res.status(400).json({
       error: 'Invalid role',
-      message: 'Role must be one of: user, propertyowner, admin'
+      message: 'Role must be user, propertyowner, or admin'
     });
+  }
+
+  // Employee ID validation for admin
+  if (userRole === 'admin') {
+    if (!profile.employee_id) {
+      return res.status(400).json({
+        error: 'Employee ID required',
+        message: 'Employee ID is required for admin registration'
+      });
+    }
+
+    if (!VALID_EMPLOYEE_IDS.includes(profile.employee_id)) {
+      return res.status(403).json({
+        error: 'Invalid Employee ID',
+        message: 'The provided Employee ID is not authorized for admin registration'
+      });
+    }
+
+    // Check if Employee ID already used
+    const existingAdmin = await query(
+      'SELECT u.id FROM users u JOIN user_profiles up ON u.id = up.user_id WHERE u.role = ? AND up.employee_id = ?',
+      ['admin', profile.employee_id]
+    );
+
+    if (existingAdmin.length > 0) {
+      return res.status(409).json({
+        error: 'Employee ID already used',
+        message: 'This Employee ID is already registered to another admin account'
+      });
+    }
   }
 
   try {
+    // Check existing users
     const existingUsers = await query(
-      'SELECT id, username, email FROM users WHERE username = ? OR email = ?',
+      'SELECT username, email FROM users WHERE username = ? OR email = ?',
       [username, email]
     );
 
@@ -83,8 +97,6 @@ router.post('/register', async (req, res) => {
 
     const saltRounds = 12;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
-    
-    // Generate email verification token
     const emailVerificationToken = crypto.randomBytes(32).toString('hex');
 
     const userResult = await query(
@@ -94,6 +106,7 @@ router.post('/register', async (req, res) => {
 
     const userId = userResult.insertId;
 
+    // Profile creation
     if (profile && Object.keys(profile).length > 0) {
       const profileFields = [];
       const profileValues = [userId];
@@ -101,7 +114,7 @@ router.post('/register', async (req, res) => {
       const allowedFields = [
         'first_name', 'last_name', 'phone', 'gender', 'birthdate', 'nationality', 'identification_number',
         'business_name', 'contact_person', 'business_type', 'business_registration', 'business_address',
-        'department', 'admin_level'
+        'department', 'admin_level', 'employee_id'
       ];
 
       allowedFields.forEach(field => {
@@ -120,28 +133,12 @@ router.post('/register', async (req, res) => {
           (user_id, ${profileFields.join(', ')}, created_at, updated_at) 
           VALUES (?, ${profileFields.map(() => '?').join(', ')}, NOW(), NOW())
         `;
-        
-        console.log('Inserting profile data:', { profileFields, profileValues });
         await query(profileQuery, profileValues);
       } else {
-        console.log('No profile fields to insert for user:', userId);
-        
-        const emptyProfileQuery = `
-          INSERT INTO user_profiles 
-          (user_id, created_at, updated_at) 
-          VALUES (?, NOW(), NOW())
-        `;
-        await query(emptyProfileQuery, [userId]);
+        await query('INSERT INTO user_profiles (user_id, created_at, updated_at) VALUES (?, NOW(), NOW())', [userId]);
       }
     } else {
-      console.log('Creating empty profile record for user:', userId);
-      
-      const emptyProfileQuery = `
-        INSERT INTO user_profiles 
-        (user_id, created_at, updated_at) 
-        VALUES (?, NOW(), NOW())
-      `;
-      await query(emptyProfileQuery, [userId]);
+      await query('INSERT INTO user_profiles (user_id, created_at, updated_at) VALUES (?, NOW(), NOW())', [userId]);
     }
 
     // Send verification email
@@ -165,7 +162,7 @@ router.post('/register', async (req, res) => {
     const token = generateToken(newUser);
 
     res.status(201).json({
-      message: 'User registered successfully. Please check your email for verification instructions.',
+      message: 'User registered successfully. Please check your email for verification.',
       token,
       user: {
         id: newUser.id,
@@ -186,7 +183,57 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// Add this new email verification endpoint:
+router.post('/validate-employee-id', async (req, res) => {
+  const { employee_id } = req.body;
+
+  if (!employee_id) {
+    return res.status(400).json({
+      valid: false,
+      message: 'Employee ID is required'
+    });
+  }
+
+  try {
+    const VALID_EMPLOYEE_IDS = [
+      'EMP001', 'EMP002', 'EMP003', 'EMP004', 'EMP005',
+      'EMP006', 'EMP007', 'EMP008', 'EMP009', 'EMP010'
+    ];
+
+    if (!VALID_EMPLOYEE_IDS.includes(employee_id)) {
+      return res.json({
+        valid: false,
+        message: 'Employee ID is not authorized for admin registration'
+      });
+    }
+
+    // Check if already used
+    const existingAdmin = await query(
+      'SELECT u.id FROM users u JOIN user_profiles up ON u.id = up.user_id WHERE u.role = ? AND up.employee_id = ?',
+      ['admin', employee_id]
+    );
+
+    if (existingAdmin.length > 0) {
+      return res.json({
+        valid: false,
+        message: 'Employee ID is already registered to another admin account'
+      });
+    }
+
+    res.json({
+      valid: true,
+      message: 'Employee ID is valid and available'
+    });
+
+  } catch (error) {
+    console.error('Employee ID validation error:', error);
+    res.status(500).json({
+      valid: false,
+      message: 'Validation failed. Please try again.'
+    });
+  }
+});
+
+// Email verification endpoint:
 router.post('/verify-email', async (req, res) => {
   const { token } = req.body;
 
@@ -348,10 +395,20 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    // Check email verification
+    if (!user.email_verified) {
+      return res.status(403).json({
+        error: 'Email not verified',
+        message: 'Please verify your email address before logging in.',
+        email: user.email,
+        requiresVerification: true
+      });
+    }
+
     const token = generateToken(user);
 
     await query(
-      'UPDATE users SET updated_at = NOW() WHERE id = ?',
+      'UPDATE users SET last_login = NOW(), updated_at = NOW() WHERE id = ?',
       [user.id]
     );
 

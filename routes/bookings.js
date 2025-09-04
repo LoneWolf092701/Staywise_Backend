@@ -1405,5 +1405,101 @@ router.get('/property/:propertyId/status', auth, async (req, res) => {
   }
 });
 
+router.post('/:id/upload-documents', auth, (req, res, next) => {
+  // Use existing upload middleware with field names for booking documents
+  const uploadMiddleware = upload.uploadMultipleFiles;
+  uploadMiddleware(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({
+        error: 'Upload failed',
+        message: err.message
+      });
+    }
+    next();
+  });
+}, async (req, res) => {
+  const bookingId = req.params.id;
+  const userId = req.user.id;
+
+  try {
+    // Verify booking belongs to user
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND user_id = ?',
+      [bookingId, userId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        error: 'Booking not found'
+      });
+    }
+
+    if (!req.files || !req.files.paymentReceipt || !req.files.nicPhoto) {
+      return res.status(400).json({
+        error: 'Missing files',
+        message: 'Both payment receipt and NIC photo are required'
+      });
+    }
+
+    const paymentReceipt = req.files.paymentReceipt[0];
+    const nicPhoto = req.files.nicPhoto[0];
+
+    // Update booking with uploaded file URLs (from existing upload processing)
+    await query(
+      `UPDATE booking_requests 
+       SET payment_proof_url = ?, 
+           verification_document_url = ?, 
+           verification_document_type = 'NIC',
+           payment_method = 'receipt_upload',
+           status = 'payment_submitted',
+           payment_submitted_at = NOW()
+       WHERE id = ?`,
+      [paymentReceipt.url, nicPhoto.url, bookingId]
+    );
+
+    // Notify property owner
+    const bookingData = booking[0];
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
+       VALUES (?, 'payment_submitted', 'Payment Documents Uploaded', 
+               'A tenant has uploaded payment receipt and verification documents.', ?, ?, ?)`,
+      [
+        bookingData.property_owner_id,
+        bookingId,
+        userId,
+        JSON.stringify({
+          payment_receipt: paymentReceipt.filename,
+          nic_document: nicPhoto.filename
+        })
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: 'Documents uploaded successfully',
+      files: {
+        payment_receipt: {
+          url: paymentReceipt.url,
+          filename: paymentReceipt.filename,
+          originalname: paymentReceipt.originalname
+        },
+        nic_photo: {
+          url: nicPhoto.url, 
+          filename: nicPhoto.filename,
+          originalname: nicPhoto.originalname
+        }
+      },
+      booking_status: 'payment_submitted'
+    });
+
+  } catch (error) {
+    console.error('Document upload error:', error);
+    res.status(500).json({
+      error: 'Upload failed',
+      message: 'Failed to upload documents. Please try again.'
+    });
+  }
+});
+
 
 module.exports = router;
