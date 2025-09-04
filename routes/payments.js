@@ -3,93 +3,87 @@ const router = express.Router();
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { auth } = require('../middleware/auth');
 const { query } = require('../config/db');
+const { createPaymentIntent, verifyPayment } = require('../utils/paymentGateway');
+
 
 router.post('/create-payment-intent', auth, async (req, res) => {
   try {
     const { booking_id, amount, payment_method_id } = req.body;
     const userId = req.user.id;
 
-    if (!booking_id || !amount || !payment_method_id) {
+    if (!booking_id || !amount) {
       return res.status(400).json({
-        error: 'booking_id, amount, and payment_method_id are required'
+        error: 'Missing required fields',
+        message: 'Booking ID and amount are required'
       });
     }
 
-    if (amount < 50) {
-      return res.status(400).json({
-        error: 'Amount must be at least 50 cents'
-      });
-    }
-
+    // Verify booking belongs to user
     const booking = await query(
-      'SELECT id, user_id, property_id, status, advance_amount FROM booking_requests WHERE id = ? AND user_id = ?',
+      'SELECT * FROM booking_requests WHERE id = ? AND user_id = ?',
       [booking_id, userId]
     );
 
     if (booking.length === 0) {
       return res.status(404).json({
-        error: 'Booking not found or does not belong to you'
+        error: 'Booking not found'
       });
     }
 
-    if (booking[0].status !== 'approved') {
-      return res.status(400).json({
-        error: 'Booking must be approved before payment'
+    const bookingData = booking[0];
+    const result = await createPaymentIntent(amount, booking_id, bookingData.email);
+
+    if (!result.success) {
+      return res.status(500).json({
+        error: 'Payment intent creation failed',
+        message: result.error
       });
     }
-
-    const expectedAmount = Math.round(booking[0].advance_amount * 100);
-    if (amount !== expectedAmount) {
-      return res.status(400).json({
-        error: `Expected amount: ${expectedAmount} cents, received: ${amount} cents`
-      });
-    }
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount,
-      currency: 'lkr',
-      payment_method: payment_method_id,
-      confirmation_method: 'manual',
-      confirm: true,
-      return_url: `${process.env.CLIENT_URL}/booking-success`,
-      metadata: {
-        booking_id: booking_id.toString(),
-        user_id: userId.toString(),
-        property_id: booking[0].property_id.toString()
-      }
-    });
 
     res.json({
-      client_secret: paymentIntent.client_secret,
-      status: paymentIntent.status
+      client_secret: result.client_secret,
+      payment_intent_id: result.payment_intent_id
     });
 
   } catch (error) {
-    console.error('Error creating payment intent:', error);
-    
-    if (error.type === 'StripeCardError') {
-      res.status(400).json({
-        error: 'Card error',
-        message: error.message
-      });
-    } else if (error.type === 'StripeRateLimitError') {
-      res.status(429).json({
-        error: 'Too many requests. Please try again later.'
-      });
-    } else if (error.type === 'StripeInvalidRequestError') {
-      res.status(400).json({
-        error: 'Invalid request',
-        message: error.message
-      });
-    } else if (error.type === 'StripeAPIError') {
-      res.status(500).json({
-        error: 'Payment processing is temporarily unavailable'
-      });
-    } else {
-      res.status(500).json({
-        error: 'Unable to process payment'
+    console.error('Create payment intent error:', error);
+    res.status(500).json({
+      error: 'Payment processing failed'
+    });
+  }
+});
+
+// Verify Stripe payment
+router.post('/verify-stripe-payment', auth, async (req, res) => {
+  try {
+    const { payment_intent_id } = req.body;
+
+    if (!payment_intent_id) {
+      return res.status(400).json({
+        error: 'Payment intent ID required'
       });
     }
+
+    const result = await verifyPayment(payment_intent_id);
+
+    if (!result.success) {
+      return res.status(400).json({
+        error: 'Payment verification failed',
+        message: result.error
+      });
+    }
+
+    res.json({
+      success: true,
+      status: result.status,
+      amount: result.amount
+    });
+
+  } catch (error) {
+    console.error('Verify payment error:', error);
+    res.status(500).json({
+      error: 'Payment verification failed'
+    });
   }
 });
 
