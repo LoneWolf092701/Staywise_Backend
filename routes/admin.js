@@ -38,15 +38,15 @@ const validateCoordinates = (latitude, longitude) => {
 
 router.get('/dashboard', auth, requireAdmin, async (req, res) => {
   try {
+    // Stats query
     const statsQuery = `
       SELECT 
         (SELECT COUNT(*) FROM users) as total_users,
-        (SELECT COUNT(*) FROM users WHERE role = 'user') as total_regular_users,
-        (SELECT COUNT(*) FROM users WHERE role = 'propertyowner') as total_property_owners,
+        (SELECT COUNT(*) FROM users WHERE is_active = 1) as active_users,
+        (SELECT COUNT(*) FROM users WHERE DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)) as new_this_month,
         (SELECT COUNT(*) FROM all_properties) as total_properties,
         (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'pending') as pending_properties,
         (SELECT COUNT(*) FROM all_properties WHERE approval_status = 'approved') as approved_properties,
-        (SELECT COUNT(*) FROM all_properties WHERE is_active = 1) as active_properties,
         (SELECT COUNT(*) FROM booking_requests) as total_bookings,
         (SELECT COUNT(*) FROM booking_requests WHERE status = 'pending') as pending_bookings,
         (SELECT COUNT(*) FROM booking_requests WHERE status = 'confirmed') as confirmed_bookings,
@@ -55,8 +55,32 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
     `;
 
     const stats = await query(statsQuery);
-    const dashboardStats = stats[0];
+    const rawStats = stats[0];
 
+    // Format stats to match frontend expectations
+    const formattedStats = {
+      users: {
+        total: rawStats.total_users,
+        active: rawStats.active_users,
+        new_this_month: rawStats.new_this_month
+      },
+      properties: {
+        total: rawStats.total_properties,
+        pending: rawStats.pending_properties,
+        approved: rawStats.approved_properties
+      },
+      bookings: {
+        total: rawStats.total_bookings,
+        pending: rawStats.pending_bookings,
+        confirmed: rawStats.confirmed_bookings
+      },
+      revenue: {
+        total: parseFloat(rawStats.total_revenue),
+        this_month: parseFloat(rawStats.monthly_revenue)
+      }
+    };
+
+    // Recent properties query
     const recentPropsQuery = `
       SELECT ap.id, ap.property_type, ap.unit_type, ap.address, ap.created_at, ap.approval_status,
              u.username as owner_username, u.email as owner_email
@@ -67,8 +91,7 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
       LIMIT 10
     `;
 
-    const recentProperties = await query(recentPropsQuery);
-
+    // Recent bookings query
     const recentBookingsQuery = `
       SELECT br.id, br.first_name, br.last_name, br.status, br.check_in_date, br.check_out_date,
              br.total_price, br.advance_amount, br.created_at,
@@ -78,13 +101,12 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
       FROM booking_requests br
       INNER JOIN all_properties ap ON br.property_id = ap.id
       INNER JOIN users tenant ON br.user_id = tenant.id
-      INNER JOIN users owner ON br.property_owner_id = owner.id
+      INNER JOIN users owner ON ap.user_id = owner.id
       ORDER BY br.created_at DESC
       LIMIT 10
     `;
 
-    const recentBookings = await query(recentBookingsQuery);
-
+    // Recent users query
     const recentUsersQuery = `
       SELECT u.id, u.username, u.email, u.role, u.email_verified, u.is_active, u.created_at,
              up.first_name, up.last_name
@@ -94,17 +116,33 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
       LIMIT 10
     `;
 
-    const recentUsers = await query(recentUsersQuery);
+    // Execute all queries
+    const [recentProperties, recentBookings, recentUsers] = await Promise.all([
+      query(recentPropsQuery),
+      query(recentBookingsQuery),
+      query(recentUsersQuery)
+    ]);
+
+    console.log('Dashboard data:', {
+      stats: formattedStats,
+      recent_properties_count: recentProperties.length,
+      recent_bookings_count: recentBookings.length,
+      recent_users_count: recentUsers.length
+    });
 
     res.json({
-      stats: dashboardStats,
+      stats: formattedStats,
       recent_properties: recentProperties.map(prop => ({
         ...prop,
         amenities: safeJsonParse(prop.amenities),
         facilities: safeJsonParse(prop.facilities),
         images: safeJsonParse(prop.images)
       })),
-      recent_bookings: recentBookings,
+      recent_bookings: recentBookings.map(booking => ({
+        ...booking,
+        total_price: parseFloat(booking.total_price || 0),
+        advance_amount: parseFloat(booking.advance_amount || 0)
+      })),
       recent_users: recentUsers
     });
 
@@ -112,7 +150,8 @@ router.get('/dashboard', auth, requireAdmin, async (req, res) => {
     console.error('Error fetching admin dashboard:', error);
     res.status(500).json({
       error: 'Database error',
-      message: 'Unable to fetch dashboard data. Please try again.'
+      message: 'Unable to fetch dashboard data. Please try again.',
+      details: error.message
     });
   }
 });
@@ -881,7 +920,7 @@ router.get('/booking-requests', auth, requireAdmin, async (req, res) => {
       FROM booking_requests br
       INNER JOIN all_properties ap ON br.property_id = ap.id
       INNER JOIN users tenant ON br.user_id = tenant.id
-      INNER JOIN users owner ON br.property_owner_id = owner.id
+      INNER JOIN users owner ON ap.user_id = owner.id
       ${whereClause}
       ORDER BY br.${sort_by} ${sort_order}
       LIMIT ? OFFSET ?

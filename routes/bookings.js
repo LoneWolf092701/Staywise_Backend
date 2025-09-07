@@ -298,15 +298,20 @@ router.get('/owner', auth, requirePropertyOwner, async (req, res) => {
   const status = req.query.status;
 
   try {
-    let whereClause = 'WHERE br.property_owner_id = ?';
+    let whereClause = 'WHERE ap.user_id = ?';
     let queryParams = [ownerId];
 
-    if (status && ['pending', 'approved', 'rejected', 'cancelled'].includes(status)) {
+    if (status && ['pending', 'approved', 'rejected', 'cancelled', 'confirmed', 'payment_submitted'].includes(status)) {
       whereClause += ' AND br.status = ?';
       queryParams.push(status);
     }
 
-    const countQuery = `SELECT COUNT(*) as total FROM booking_requests br ${whereClause}`;
+    const countQuery = `
+      SELECT COUNT(*) as total 
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      ${whereClause}
+    `;
     const countResult = await query(countQuery, queryParams);
     const totalBookings = countResult[0].total;
 
@@ -813,6 +818,58 @@ router.get('/user/stats', auth, async (req, res) => {
   } catch (error) {
     console.error('Error fetching booking stats:', error);
     res.status(500).json({ error: 'Failed to fetch booking stats' });
+  }
+});
+
+/**
+ * GET /api/bookings/owner/statistics
+ * Get booking statistics for property owner
+ */
+router.get('/owner/statistics', auth, requirePropertyOwner, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const bookingStatsQuery = `
+      SELECT 
+        COUNT(br.id) as total_bookings,
+        COUNT(CASE WHEN br.status = 'pending' THEN 1 END) as pending_bookings,
+        COUNT(CASE WHEN br.status = 'confirmed' THEN 1 END) as confirmed_bookings,
+        COUNT(CASE WHEN br.status = 'cancelled' THEN 1 END) as cancelled_bookings,
+        COUNT(CASE WHEN br.status = 'approved' THEN 1 END) as approved_bookings,
+        COUNT(CASE WHEN br.status = 'rejected' THEN 1 END) as rejected_bookings,
+        COALESCE(SUM(br.total_price), 0) as total_revenue,
+        COALESCE(SUM(br.advance_amount), 0) as advance_collected,
+        COALESCE(AVG(br.total_price), 0) as average_booking_value,
+        COALESCE(AVG(br.advance_amount), 0) as average_advance,
+        COALESCE(SUM(CASE WHEN br.status = 'pending' THEN br.advance_amount ELSE 0 END), 0) as pending_advance
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      WHERE ap.user_id = ?
+    `;
+
+    const bookingStats = await query(bookingStatsQuery, [userId]);
+
+    res.json({
+      total_bookings: parseInt(bookingStats[0].total_bookings) || 0,
+      confirmed_bookings: parseInt(bookingStats[0].confirmed_bookings) || 0,
+      pending_bookings: parseInt(bookingStats[0].pending_bookings) || 0,
+      cancelled_bookings: parseInt(bookingStats[0].cancelled_bookings) || 0,
+      approved_bookings: parseInt(bookingStats[0].approved_bookings) || 0,
+      rejected_bookings: parseInt(bookingStats[0].rejected_bookings) || 0,
+      total_revenue: parseFloat(bookingStats[0].total_revenue) || 0,
+      advance_collected: parseFloat(bookingStats[0].advance_collected) || 0,
+      average_booking_value: parseFloat(bookingStats[0].average_booking_value) || 0,
+      average_advance: parseFloat(bookingStats[0].average_advance) || 0,
+      pending_advance: parseFloat(bookingStats[0].pending_advance) || 0,
+      last_updated: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error fetching owner booking statistics:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch booking statistics. Please try again.'
+    });
   }
 });
 
