@@ -955,6 +955,530 @@ router.get('/booking-requests', auth, requireAdmin, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/admin/booking-requests/export-stats
+ * Get booking export statistics
+ */
+router.get('/booking-requests/export-stats', auth, requireAdmin, async (req, res) => {
+  try {
+    const { status, date_from, date_to } = req.query;
+
+    // Build WHERE clause
+    let whereClause = 'WHERE 1=1';
+    const queryParams = [];
+
+    if (status && status !== 'all') {
+      whereClause += ' AND br.status = ?';
+      queryParams.push(status);
+    }
+
+    if (date_from) {
+      whereClause += ' AND br.created_at >= ?';
+      queryParams.push(date_from);
+    }
+
+    if (date_to) {
+      whereClause += ' AND br.created_at <= ?';
+      queryParams.push(date_to + ' 23:59:59');
+    }
+
+    // Get statistics
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total_records,
+        COALESCE(SUM(br.total_price), 0) as total_revenue,
+        COALESCE(SUM(br.advance_amount), 0) as total_advance,
+        COALESCE(AVG(br.total_price), 0) as average_booking_value,
+        MIN(br.created_at) as earliest_date,
+        MAX(br.created_at) as latest_date
+      FROM booking_requests br
+      ${whereClause}
+    `;
+
+    const stats = await query(statsQuery, queryParams);
+
+    // Get status breakdown
+    const statusQuery = `
+      SELECT 
+        status,
+        COUNT(*) as count,
+        COALESCE(SUM(total_price), 0) as revenue
+      FROM booking_requests br
+      ${whereClause}
+      GROUP BY status
+      ORDER BY count DESC
+    `;
+
+    const statusBreakdown = await query(statusQuery, queryParams);
+
+    const statusBreakdownObj = {};
+    statusBreakdown.forEach(item => {
+      statusBreakdownObj[item.status] = {
+        count: parseInt(item.count) || 0,
+        revenue: parseFloat(item.revenue) || 0
+      };
+    });
+
+    res.json({
+      total_records: parseInt(stats[0].total_records) || 0,
+      total_revenue: parseFloat(stats[0].total_revenue) || 0,
+      total_advance: parseFloat(stats[0].total_advance) || 0,
+      average_booking_value: parseFloat(stats[0].average_booking_value) || 0,
+      status_breakdown: statusBreakdownObj,
+      date_range: {
+        from: date_from || null,
+        to: date_to || null,
+        earliest_record: stats[0].earliest_date,
+        latest_record: stats[0].latest_date
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching booking export stats:', error);
+    res.status(500).json({
+      error: 'Database error',
+      message: 'Unable to fetch export statistics'
+    });
+  }
+});
+
+/**
+ * GET /api/admin/booking-requests/export
+ * Export booking requests data
+ */
+router.get('/booking-requests/export', auth, requireAdmin, async (req, res) => {
+  try {
+    const { 
+      format = 'csv',
+      status,
+      date_from,
+      date_to,
+      include_guest_details = 'true',
+      include_property_details = 'true',
+      include_payment_details = 'true',
+      include_owner_details = 'false'
+    } = req.query;
+
+    // Build WHERE clause
+    let whereClause = 'WHERE 1=1';
+    const queryParams = [];
+
+    if (status && status !== 'all') {
+      whereClause += ' AND br.status = ?';
+      queryParams.push(status);
+    }
+
+    if (date_from) {
+      whereClause += ' AND br.created_at >= ?';
+      queryParams.push(date_from);
+    }
+
+    if (date_to) {
+      whereClause += ' AND br.created_at <= ?';
+      queryParams.push(date_to + ' 23:59:59');
+    }
+
+    // Build SELECT clause based on actual columns that exist
+    let selectFields = [
+      'br.id as booking_id',
+      'br.status',
+      'br.check_in_date',
+      'br.check_out_date',
+      'br.booking_days',
+      'br.booking_months',
+      'br.total_price',
+      'br.advance_amount',
+      'br.service_fee',
+      'br.created_at',
+      'br.updated_at'
+    ];
+
+    let joinClause = 'FROM booking_requests br';
+
+    if (include_guest_details === 'true') {
+      selectFields.push(
+        'br.first_name',
+        'br.last_name',
+        'br.email',
+        'br.country_code',
+        'br.mobile_number',
+        'br.birthdate',
+        'br.gender',
+        'br.nationality',
+        'br.occupation',
+        'br.field',
+        'br.destination',
+        'br.relocation_details'
+      );
+    }
+
+    if (include_property_details === 'true') {
+      selectFields.push(
+        'COALESCE(ap.property_type, "N/A") as property_type',
+        'COALESCE(ap.unit_type, "N/A") as unit_type',
+        'COALESCE(ap.address, "N/A") as property_address',
+        'COALESCE(ap.price, 0) as property_price',
+        'COALESCE(ap.bedrooms, 0) as bedrooms',
+        'COALESCE(ap.bathrooms, 0) as bathrooms'
+      );
+      joinClause += ' LEFT JOIN all_properties ap ON br.property_id = ap.id';
+    }
+
+    if (include_owner_details === 'true') {
+      selectFields.push(
+        'COALESCE(u.first_name, "N/A") as owner_first_name',
+        'COALESCE(u.last_name, "N/A") as owner_last_name',
+        'COALESCE(u.email, "N/A") as owner_email',
+        'COALESCE(u.mobile_number, "N/A") as owner_phone'
+      );
+      joinClause += ' LEFT JOIN users u ON br.property_owner_id = u.id';
+    }
+
+    if (include_payment_details === 'true') {
+      selectFields.push(
+        'COALESCE(br.payment_method, "N/A") as payment_method',
+        'br.payment_submitted_at',
+        'br.payment_confirmed_at',
+        'br.stripe_payment_intent_id',
+        'br.stripe_payment_method_id',
+        'br.payment_proof_url',
+        'br.verification_document_url',
+        'br.verification_document_type',
+        'CASE WHEN br.payment_method = "stripe_dummy" THEN "Card Payment (Processed)" ELSE COALESCE(br.payment_method, "N/A") END as payment_method_display'
+      );
+    }
+
+    // Execute query
+    const exportQuery = `
+      SELECT ${selectFields.join(', ')}
+      ${joinClause}
+      ${whereClause}
+      ORDER BY br.created_at DESC
+    `;
+
+    const bookingData = await query(exportQuery, queryParams);
+
+    if (format === 'csv') {
+      // Generate CSV
+      const csvRows = [];
+      
+      if (bookingData.length > 0) {
+        // Header row
+        csvRows.push(Object.keys(bookingData[0]).join(','));
+        
+        // Data rows
+        bookingData.forEach(row => {
+          const values = Object.values(row).map(value => {
+            if (value === null || value === undefined) return '';
+            if (typeof value === 'string' && value.includes(',')) {
+              return `"${value.replace(/"/g, '""')}"`;
+            }
+            return value;
+          });
+          csvRows.push(values.join(','));
+        });
+      } else {
+        // Empty CSV with headers
+        csvRows.push('booking_id,status,message');
+        csvRows.push('0,no_data,No booking data found for the specified criteria');
+      }
+
+      const csvContent = csvRows.join('\n');
+      const timestamp = new Date().toISOString().split('T')[0];
+      const filename = `booking_requests_${timestamp}.csv`;
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(csvContent);
+
+    } else if (format === 'xlsx') {
+      // For Excel format, we need the xlsx library
+      try {
+        const XLSX = require('xlsx');
+        
+        const worksheet = XLSX.utils.json_to_sheet(bookingData.length > 0 ? bookingData : [
+          { booking_id: 0, status: 'no_data', message: 'No booking data found for the specified criteria' }
+        ]);
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'Booking Requests');
+        
+        const timestamp = new Date().toISOString().split('T')[0];
+        const filename = `booking_requests_${timestamp}.xlsx`;
+        
+        const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+        
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(buffer);
+      } catch (xlsxError) {
+        console.error('XLSX library not available:', xlsxError);
+        // Fallback to CSV if XLSX library is not available
+        const csvContent = bookingData.length > 0 
+          ? [Object.keys(bookingData[0]).join(','), ...bookingData.map(row => Object.values(row).join(','))].join('\n')
+          : 'booking_id,status,message\n0,no_data,No booking data found';
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="booking_requests_export.csv"');
+        res.send(csvContent);
+      }
+
+    } else {
+      res.status(400).json({
+        error: 'Invalid format',
+        message: 'Supported formats: csv, xlsx'
+      });
+    }
+
+  } catch (error) {
+    console.error('Error exporting booking data:', error);
+    res.status(500).json({
+      error: 'Export failed',
+      message: 'Unable to export booking data. Error: ' + error.message
+    });
+  }
+});
+
+/**
+ * GET /api/admin/booking-payments/export
+ * Export booking payments data
+ */
+router.get('/booking-payments/export', auth, requireAdmin, async (req, res) => {
+  try {
+    const { 
+      format = 'csv',
+      payment_method,
+      date_from,
+      date_to
+    } = req.query;
+
+    // Build WHERE clause
+    let whereClause = 'WHERE br.payment_submitted_at IS NOT NULL';
+    const queryParams = [];
+
+    if (payment_method && payment_method !== 'all') {
+      whereClause += ' AND br.payment_method = ?';
+      queryParams.push(payment_method);
+    }
+
+    if (date_from) {
+      whereClause += ' AND br.payment_submitted_at >= ?';
+      queryParams.push(date_from);
+    }
+
+    if (date_to) {
+      whereClause += ' AND br.payment_submitted_at <= ?';
+      queryParams.push(date_to + ' 23:59:59');
+    }
+
+    // Payment export query using actual columns
+    const paymentQuery = `
+      SELECT 
+        br.id as booking_id,
+        COALESCE(br.first_name, 'N/A') as first_name,
+        COALESCE(br.last_name, 'N/A') as last_name,
+        COALESCE(br.email, 'N/A') as email,
+        COALESCE(br.mobile_number, 'N/A') as mobile_number,
+        COALESCE(br.total_price, 0) as total_price,
+        COALESCE(br.advance_amount, 0) as advance_amount,
+        COALESCE(br.service_fee, 0) as service_fee,
+        COALESCE(br.payment_method, 'N/A') as payment_method,
+        CASE 
+          WHEN br.payment_method = 'stripe_dummy' THEN 'Card Payment (Processed)'
+          WHEN br.payment_method = 'stripe' THEN 'Card Payment'
+          WHEN br.payment_method = 'receipt_upload' THEN 'Bank Transfer'
+          ELSE COALESCE(br.payment_method, 'N/A')
+        END as payment_method_display,
+        br.payment_submitted_at,
+        br.payment_confirmed_at,
+        br.stripe_payment_intent_id,
+        br.payment_proof_url,
+        br.status,
+        COALESCE(ap.property_type, 'N/A') as property_type,
+        COALESCE(ap.address, 'N/A') as property_address
+      FROM booking_requests br
+      LEFT JOIN all_properties ap ON br.property_id = ap.id
+      ${whereClause}
+      ORDER BY br.payment_submitted_at DESC
+    `;
+
+    const paymentData = await query(paymentQuery, queryParams);
+
+    if (format === 'csv') {
+      // Generate CSV
+      const csvRows = [];
+      
+      if (paymentData.length > 0) {
+        // Header row
+        csvRows.push(Object.keys(paymentData[0]).join(','));
+        
+        // Data rows
+        paymentData.forEach(row => {
+          const values = Object.values(row).map(value => {
+            if (value === null || value === undefined) return '';
+            if (typeof value === 'string' && value.includes(',')) {
+              return `"${value.replace(/"/g, '""')}"`;
+            }
+            return value;
+          });
+          csvRows.push(values.join(','));
+        });
+      } else {
+        csvRows.push('booking_id,status,message');
+        csvRows.push('0,no_data,No payment data found for the specified criteria');
+      }
+
+      const csvContent = csvRows.join('\n');
+      const timestamp = new Date().toISOString().split('T')[0];
+      const filename = `booking_payments_${timestamp}.csv`;
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(csvContent);
+
+    } else if (format === 'xlsx') {
+      try {
+        const XLSX = require('xlsx');
+        
+        const worksheet = XLSX.utils.json_to_sheet(paymentData.length > 0 ? paymentData : [
+          { booking_id: 0, status: 'no_data', message: 'No payment data found' }
+        ]);
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'Payment Transactions');
+        
+        const timestamp = new Date().toISOString().split('T')[0];
+        const filename = `booking_payments_${timestamp}.xlsx`;
+        
+        const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+        
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(buffer);
+      } catch (xlsxError) {
+        // Fallback to CSV
+        const csvContent = paymentData.length > 0 
+          ? [Object.keys(paymentData[0]).join(','), ...paymentData.map(row => Object.values(row).join(','))].join('\n')
+          : 'booking_id,status,message\n0,no_data,No payment data found';
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="booking_payments_export.csv"');
+        res.send(csvContent);
+      }
+
+    } else {
+      res.status(400).json({
+        error: 'Invalid format',
+        message: 'Supported formats: csv, xlsx'
+      });
+    }
+
+  } catch (error) {
+    console.error('Error exporting payment data:', error);
+    res.status(500).json({
+      error: 'Export failed',
+      message: 'Unable to export payment data. Error: ' + error.message
+    });
+  }
+});
+
+/**
+ * GET /api/admin/booking-reports/generate
+ * Generate booking analytics reports
+ */
+router.get('/booking-reports/generate', auth, requireAdmin, async (req, res) => {
+  try {
+    const { 
+      report_type = 'summary',
+      format = 'json',
+      date_from,
+      date_to,
+      include_charts = 'true'
+    } = req.query;
+
+    // Build WHERE clause
+    let whereClause = 'WHERE 1=1';
+    const queryParams = [];
+
+    if (date_from) {
+      whereClause += ' AND br.created_at >= ?';
+      queryParams.push(date_from);
+    }
+
+    if (date_to) {
+      whereClause += ' AND br.created_at <= ?';
+      queryParams.push(date_to + ' 23:59:59');
+    }
+
+    // Get summary statistics
+    const summaryQuery = `
+      SELECT 
+        COUNT(*) as total_bookings,
+        COALESCE(SUM(total_price), 0) as total_revenue,
+        COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as confirmed_bookings,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_bookings,
+        COUNT(CASE WHEN status = 'approved' THEN 1 END) as approved_bookings,
+        COUNT(CASE WHEN status = 'rejected' THEN 1 END) as rejected_bookings,
+        COALESCE(AVG(total_price), 0) as average_booking_value,
+        COALESCE(SUM(advance_amount), 0) as total_advance_collected
+      FROM booking_requests br
+      ${whereClause}
+    `;
+
+    const summary = await query(summaryQuery, queryParams);
+
+    // Get monthly breakdown
+    const monthlyQuery = `
+      SELECT 
+        DATE_FORMAT(created_at, '%Y-%m') as month,
+        COUNT(*) as bookings_count,
+        COALESCE(SUM(total_price), 0) as revenue
+      FROM booking_requests br
+      ${whereClause}
+      GROUP BY DATE_FORMAT(created_at, '%Y-%m')
+      ORDER BY month DESC
+      LIMIT 12
+    `;
+
+    const monthlyData = await query(monthlyQuery, queryParams);
+
+    const reportData = {
+      report_type: report_type,
+      date_range: { from: date_from, to: date_to },
+      generated_at: new Date().toISOString(),
+      summary: {
+        total_bookings: parseInt(summary[0].total_bookings) || 0,
+        total_revenue: parseFloat(summary[0].total_revenue) || 0,
+        confirmed_bookings: parseInt(summary[0].confirmed_bookings) || 0,
+        pending_bookings: parseInt(summary[0].pending_bookings) || 0,
+        approved_bookings: parseInt(summary[0].approved_bookings) || 0,
+        rejected_bookings: parseInt(summary[0].rejected_bookings) || 0,
+        average_booking_value: parseFloat(summary[0].average_booking_value) || 0,
+        total_advance_collected: parseFloat(summary[0].total_advance_collected) || 0,
+        conversion_rate: summary[0].total_bookings > 0 ? 
+          ((summary[0].confirmed_bookings / summary[0].total_bookings) * 100).toFixed(2) : 0
+      },
+      monthly_breakdown: monthlyData.map(row => ({
+        month: row.month,
+        bookings_count: parseInt(row.bookings_count) || 0,
+        revenue: parseFloat(row.revenue) || 0
+      }))
+    };
+
+    const timestamp = new Date().toISOString().split('T')[0];
+    const filename = `booking_report_${report_type}_${timestamp}.json`;
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.json(reportData);
+
+  } catch (error) {
+    console.error('Error generating booking report:', error);
+    res.status(500).json({
+      error: 'Report generation failed',
+      message: 'Unable to generate booking report. Error: ' + error.message
+    });
+  }
+});
+
 router.get('/system-health', auth, requireAdmin, async (req, res) => {
   try {
     const dbTest = await query('SELECT 1 as test');

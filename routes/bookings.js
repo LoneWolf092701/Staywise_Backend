@@ -1441,7 +1441,7 @@ router.get('/property/:propertyId/status', auth, async (req, res) => {
     const activeBookings = await query(
       `SELECT id, user_id, check_in_date, check_out_date, status 
        FROM booking_requests 
-       WHERE property_id = ? AND status IN ('confirmed', 'payment_submitted') 
+       WHERE property_id = ? AND status IN ('approved', 'confirmed', 'payment_submitted') 
        AND check_out_date >= CURDATE()`,
       [propertyId]
     );
@@ -1554,6 +1554,88 @@ router.post('/:id/upload-documents', auth, (req, res, next) => {
     res.status(500).json({
       error: 'Upload failed',
       message: 'Failed to upload documents. Please try again.'
+    });
+  }
+});
+
+/**
+ * POST /api/bookings/:id/dummy-payment
+ * Handle dummy payment for API key error fallback
+ */
+router.post('/:id/dummy-payment', auth, async (req, res) => {
+  const bookingId = req.params.id;
+  const userId = req.user.id;
+  const { payment_intent_id, payment_method_id, dummy_payment } = req.body;
+
+  try {
+    // Verify booking belongs to user and is approved
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND user_id = ?',
+      [bookingId, userId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        error: 'Booking not found'
+      });
+    }
+
+    if (booking[0].status !== 'approved') {
+      return res.status(400).json({
+        error: 'Booking must be approved for payment'
+      });
+    }
+
+    // Update booking with dummy payment info - set status to confirmed directly
+    await query(
+      `UPDATE booking_requests 
+       SET stripe_payment_intent_id = ?, stripe_payment_method_id = ?,
+           payment_method = 'stripe_dummy', status = 'confirmed', 
+           payment_submitted_at = NOW(), payment_confirmed_at = NOW()
+       WHERE id = ?`,
+      [payment_intent_id, payment_method_id, bookingId]
+    );
+
+    // Notify owner about successful payment
+    try {
+      await query(
+        `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
+         VALUES (?, 'booking_confirmed', 'Booking Confirmed', 
+                 'A tenant has completed payment and the booking is now confirmed.', ?, ?, ?)`,
+        [
+          booking[0].property_owner_id,
+          bookingId,
+          userId,
+          JSON.stringify({ payment_intent_id, payment_method_id, dummy_payment: true })
+        ]
+      );
+    } catch (notificationError) {
+      console.error('Error creating notification:', notificationError);
+    }
+
+    // Get updated booking details for response
+    const updatedBooking = await query(`
+      SELECT 
+        br.*,
+        ap.property_type, ap.unit_type, ap.address as property_address,
+        u.username as owner_username
+      FROM booking_requests br
+      INNER JOIN all_properties ap ON br.property_id = ap.id
+      INNER JOIN users u ON br.property_owner_id = u.id
+      WHERE br.id = ?
+    `, [bookingId]);
+
+    res.json({
+      message: 'Dummy payment processed successfully - Booking confirmed',
+      status: 'confirmed',
+      booking: updatedBooking[0]
+    });
+
+  } catch (error) {
+    console.error('Error processing dummy payment:', error);
+    res.status(500).json({
+      error: 'Payment processing failed',
+      message: 'Unable to process payment. Please try again.'
     });
   }
 });
