@@ -46,7 +46,7 @@ pool.on('error', function(err) {
     console.error('Unexpected database error:', err);
   }
 });
-
+//safety measures
 pool.on('acquire', function (connection) {
   console.log(`Connection ${connection.threadId} acquired`);
 });

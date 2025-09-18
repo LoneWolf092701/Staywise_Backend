@@ -697,6 +697,7 @@ router.get('/properties/:id', auth, requireAdmin, async (req, res) => {
   }
 });
 
+
 router.put('/properties/:id/approval', auth, requireAdmin, async (req, res) => {
   const propertyId = req.params.id;
   const { approval_status, rejection_reason } = req.body;
@@ -818,6 +819,8 @@ router.put('/properties/:id/approval', auth, requireAdmin, async (req, res) => {
     });
   }
 });
+
+// Delete property and associated details
 
 router.delete('/properties/:id', auth, requireAdmin, async (req, res) => {
   const propertyId = req.params.id;

@@ -21,6 +21,7 @@ const paymentRoutes = require('./routes/payments');
 
 const app = express();
 
+// CORS configuration with dynamic origin based on environment variables
 app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:3000',
   credentials: true,
@@ -28,6 +29,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   exposedHeaders: ['X-Token-Warning']
 }));
+
+// Security headers
 
 app.use(helmet({
   contentSecurityPolicy: {
@@ -46,6 +49,7 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 
+// Compression
 app.use(compression());
 
 app.use(morgan('combined', {

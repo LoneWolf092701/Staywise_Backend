@@ -3,7 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query, executeTransaction } = require('../config/db');
-const { auth, requireAdmin } = require('../middleware/auth');
+const { auth, requireAdmin, sensitiveOpRateLimit } = require('../middleware/auth');
 const crypto = require('crypto');
 const { sendEmailVerification, sendPasswordResetEmail } = require('../services/emailService');
 
@@ -182,6 +182,8 @@ router.post('/register', async (req, res) => {
     });
   }
 });
+
+// Employee ID validation endpoint
 
 router.post('/validate-employee-id', async (req, res) => {
   const { employee_id } = req.body;
@@ -379,10 +381,12 @@ router.post('/login', async (req, res) => {
     );
 
     if (users.length === 0) {
+      sensitiveOpRateLimit(req, res); // Rate limiting on failed login
       return res.status(401).json({
         error: 'Invalid credentials',
         message: 'Username or password is incorrect'
       });
+
     }
 
     const user = users[0];
