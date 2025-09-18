@@ -34,6 +34,14 @@ router.post('/create-payment-intent', auth, async (req, res) => {
     const result = await createPaymentIntent(amount, booking_id, bookingData.email);
 
     if (!result.success) {
+      // Check if it's specifically an API key error
+      if (result.error === 'STRIPE_API_KEY_ERROR') {
+        return res.status(400).json({
+          error: 'STRIPE_API_KEY_ERROR',
+          message: 'Payment service temporarily unavailable'
+        });
+      }
+      
       return res.status(500).json({
         error: 'Payment intent creation failed',
         message: result.error

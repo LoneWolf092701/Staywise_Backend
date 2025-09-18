@@ -22,6 +22,16 @@ async function createPaymentIntent(amount, bookingId, userEmail) {
     };
   } catch (error) {
     console.error('Stripe payment intent error:', error);
+    
+    // Check if it's an API key error and return special error code
+    if (error.message && error.message.toLowerCase().includes('invalid api key')) {
+      return {
+        success: false,
+        error: 'STRIPE_API_KEY_ERROR',
+        original_error: error.message
+      };
+    }
+    
     return {
       success: false,
       error: error.message
@@ -43,6 +53,16 @@ async function verifyPayment(paymentIntentId) {
     };
   } catch (error) {
     console.error('Payment verification error:', error);
+    
+    // Check if it's an API key error and return special error code
+    if (error.message && error.message.toLowerCase().includes('invalid api key')) {
+      return {
+        success: false,
+        error: 'STRIPE_API_KEY_ERROR',
+        original_error: error.message
+      };
+    }
+    
     return {
       success: false,
       error: error.message

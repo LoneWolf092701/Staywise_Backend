@@ -46,7 +46,8 @@
     "mysql2": "^3.6.5",
     "nodemailer": "^7.0.5",
     "path": "^0.12.7",
-    "stripe": "^18.5.0"
+    "stripe": "^18.5.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "eslint": "^8.56.0",
