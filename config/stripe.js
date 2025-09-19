@@ -8,6 +8,7 @@ const createPaymentIntent = async (amount, currency = 'lkr', metadata = {}) => {
       metadata: metadata,
       automatic_payment_methods: {
         enabled: true,
+        allow_redirects: 'never'
       },
     });
 
@@ -20,9 +21,16 @@ const createPaymentIntent = async (amount, currency = 'lkr', metadata = {}) => {
 
 const confirmPaymentIntent = async (paymentIntentId, paymentMethodId) => {
   try {
-    const paymentIntent = await stripe.paymentIntents.confirm(paymentIntentId, {
+    const confirmData = {
       payment_method: paymentMethodId,
-    });
+    };
+
+    // Add return_url for safety
+    const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    confirmData.return_url = `${baseUrl}/payment/success`;
+
+    const paymentIntent = await stripe.paymentIntents.confirm(paymentIntentId, confirmData);
+
 
     return paymentIntent;
   } catch (error) {
