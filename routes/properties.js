@@ -1039,9 +1039,17 @@ router.post('/', auth, requirePropertyOwner, async (req, res) => {
       }
     }
 
+    // Map frontend property types to database enum values
+    const propertyTypeMapping = {
+      'Rooms': 'room',
+      'Flats': 'apartment', 
+      'Hostels': 'hostel',
+      'Villas': 'villa'
+    };
+
     // Map frontend camelCase to backend snake_case
     const mappedData = {
-      property_type: propertyData.property_type,
+      property_type: propertyTypeMapping[propertyData.property_type] || propertyData.property_type,
       unit_type: propertyData.unit_type,
       address: propertyData.address,
        latitude: propertyData.latitude || null,
@@ -1140,9 +1148,18 @@ router.put('/:id', auth, requirePropertyOwnership, async (req, res) => {
   }
 
   try {
+
+     // Map frontend property types to database enum values
+    const propertyTypeMapping = {
+      'Rooms': 'room',
+      'Flats': 'apartment', 
+      'Hostels': 'hostel',
+      'Villas': 'villa'
+    };
+
     // Map frontend camelCase to backend snake_case
     const mappedData = {
-      property_type: propertyData.property_type,
+      property_type: propertyTypeMapping[propertyData.property_type] || propertyData.property_type,
       unit_type: propertyData.unit_type,
       address: propertyData.address,
       latitude: propertyData.latitude || null,
