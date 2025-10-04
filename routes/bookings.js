@@ -121,14 +121,13 @@ router.post('/', auth, requireUser, async (req, res) => {
         message: 'You cannot book your own property'
       });
     }
-
-    const existingBookings = await query(
+       const existingBookings = await query(
       `SELECT id FROM booking_requests 
-       WHERE property_id = ? AND user_id = ? AND status IN ('pending', 'approved', 'confirmed')
+       WHERE property_id = ? AND status IN ('pending', 'approved', 'confirmed')
        AND ((check_in_date <= ? AND check_out_date > ?) OR 
             (check_in_date < ? AND check_out_date >= ?) OR
             (check_in_date >= ? AND check_out_date <= ?))`,
-      [property_id, userId, check_in_date, check_in_date, check_out_date, check_out_date, check_in_date, check_out_date]
+      [property_id, check_in_date, check_in_date, check_out_date, check_out_date, check_in_date, check_out_date]
     );
 
     if (existingBookings.length > 0) {
