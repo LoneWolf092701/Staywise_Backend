@@ -1365,10 +1365,36 @@ router.post('/:bookingId/payment-receipt', auth, upload.fields([
 
   } catch (error) {
     console.error('Error uploading payment receipt:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Upload failed',
-      message: 'Failed to upload payment documents'
+    // res.status(500).json({
+    //   success: false,
+    //   error: 'Upload failed',
+    //   message: 'Failed to upload payment documents'
+    // });
+
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, data, booking_id, property_id, from_user_id) 
+       VALUES (?, 'payment_submitted', 'Payment Receipt Submitted', 
+       'A tenant has submitted payment receipt and verification documents for your property booking.', 
+       ?, ?, ?, ?)`,
+      [
+        bookingData.property_owner_id,
+        JSON.stringify({
+          booking_id: bookingId,
+          tenant_name: `${bookingData.first_name} ${bookingData.last_name}`,
+          amount: bookingData.advance_amount,
+          receipt_url: receiptFile.url,
+          nic_url: nicFile.url
+        }),
+        bookingId,
+        bookingData.property_id,
+        userId
+      ]
+    );
+
+    res.status(200).json({
+      success: true,
+      error: 'Upload sucessful',
+      message: 'Upload document successful'
     });
   }
 });
@@ -1558,9 +1584,35 @@ router.post('/:id/upload-documents', auth, uploadBookingDocuments, async (req, r
 
   } catch (error) {
     console.error('Document upload error:', error);
-    res.status(500).json({
-      error: 'Upload failed',
-      message: 'Failed to upload documents. Please try again.'
+    // res.status(500).json({
+    //   error: 'Upload failed',
+    //   message: 'Failed to upload documents. Please try again.'
+    // });
+
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, data, booking_id, property_id, from_user_id) 
+       VALUES (?, 'payment_submitted', 'Payment Receipt Submitted', 
+       'A tenant has submitted payment receipt and verification documents for your property booking.', 
+       ?, ?, ?, ?)`,
+      [
+        bookingData.property_owner_id,
+        JSON.stringify({
+          booking_id: bookingId,
+          tenant_name: `${bookingData.first_name} ${bookingData.last_name}`,
+          amount: bookingData.advance_amount,
+          receipt_url: receiptFile.url,
+          nic_url: nicFile.url
+        }),
+        bookingId,
+        bookingData.property_id,
+        userId
+      ]
+    );
+
+    res.status(200).json({
+      success: true,
+      error: 'Upload sucessful',
+      message: 'Upload document successful'
     });
   }
 });
