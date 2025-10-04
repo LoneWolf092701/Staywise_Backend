@@ -207,6 +207,25 @@ router.get('/dashboard-stats', auth, requireAdmin, async (req, res) => {
   }
 });
 
+// Check if a property has active bookings
+router.get('/properties/:id/has-active-bookings', auth, requireAdmin, async (req, res) => {
+  const propertyId = req.params.id;
+  try {
+    const bookings = await query(
+      'SELECT COUNT(*) as count FROM booking_requests WHERE property_id = ? AND status IN ("pending", "confirmed")',
+      [propertyId]
+    );
+    const count = bookings[0].count;
+    res.json({
+      hasActiveBookings: count > 0,
+      activeBookingsCount: count
+    });
+  } catch (error) {
+    console.error('Error checking active bookings:', error);
+    res.status(500).json({ error: 'Failed to check active bookings' });
+  }
+});
+
 router.get('/users', auth, requireAdmin, async (req, res) => {
   try {
     const {
