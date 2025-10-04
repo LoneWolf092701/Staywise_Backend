@@ -445,10 +445,16 @@ if (!azureConnectionFailed) {
   });
 }
 
+const uploadBookingDocuments = upload.fields([
+  { name: 'paymentReceipt', maxCount: 1 },
+  { name: 'nicPhoto', maxCount: 1 }
+]);
+
 module.exports = {
   upload,
   uploadToAzure,
   deleteFromAzure,
+  uploadBookingDocuments,
   handleUploadError,
   validateImageDimensions,
   uploadProfileImage,
