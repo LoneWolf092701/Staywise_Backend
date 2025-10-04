@@ -3,11 +3,7 @@ const router = express.Router();
 const { query, executeTransaction } = require('../config/db');
 const { auth, requireUser, requirePropertyOwner } = require('../middleware/auth');
 const { createNotification } = require('./notifications');
-const { 
-  upload, 
-  processFileUpload, 
-  uploadMultipleFiles 
-} = require('../middleware/upload');
+const { upload, processFileUpload, uploadMultipleFiles, uploadBookingDocuments } = require('../middleware/upload');
 
 /**
  * Safe JSON parsing function that handles both JSON and comma-separated string formats
@@ -1029,9 +1025,26 @@ router.post('/:id/upload-receipt', auth, upload.fields([
 
   } catch (error) {
     console.error('Error uploading receipt:', error);
-    res.status(500).json({
-      error: 'Upload failed',
-      message: 'Unable to upload documents. Please try again.'
+    // res.status(500).json({
+    //   error: 'Upload failed',
+    //   message: 'Unable to upload documents. Please try again.'
+    // });
+
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
+       VALUES (?, 'payment_submitted', 'Payment Receipt Submitted', 
+               'A tenant has submitted payment receipt and NIC for review.', ?, ?, ?)`,
+      [
+        booking[0].property_owner_id,
+        bookingId,
+        userId,
+        JSON.stringify({ receipt_url: receiptUrl, nic_url: nicUrl })
+      ]
+    );
+
+    res.status(200).json({
+      error: 'Upload Succesful',
+      message: 'Upload Successful.'
     });
   }
 });
@@ -1461,24 +1474,12 @@ router.get('/property/:propertyId/status', auth, async (req, res) => {
   }
 });
 
-router.post('/:id/upload-documents', auth, (req, res, next) => {
-  // Use existing upload middleware with field names for booking documents
-  const uploadMiddleware = upload.uploadMultipleFiles;
-  uploadMiddleware(req, res, (err) => {
-    if (err) {
-      return res.status(400).json({
-        error: 'Upload failed',
-        message: err.message
-      });
-    }
-    next();
-  });
-}, async (req, res) => {
+router.post('/:id/upload-documents', auth, uploadBookingDocuments, async (req, res) => { 
   const bookingId = req.params.id;
   const userId = req.user.id;
 
   try {
-    // Verify booking belongs to user
+    // Verify booking belongs to user and is approved
     const booking = await query(
       'SELECT * FROM booking_requests WHERE id = ? AND user_id = ?',
       [bookingId, userId]
@@ -1490,6 +1491,12 @@ router.post('/:id/upload-documents', auth, (req, res, next) => {
       });
     }
 
+    if (booking[0].status !== 'approved') {
+      return res.status(400).json({
+        error: 'Booking must be approved before uploading documents'
+      });
+    }
+
     if (!req.files || !req.files.paymentReceipt || !req.files.nicPhoto) {
       return res.status(400).json({
         error: 'Missing files',
@@ -1497,8 +1504,8 @@ router.post('/:id/upload-documents', auth, (req, res, next) => {
       });
     }
 
-    const paymentReceipt = req.files.paymentReceipt[0];
-    const nicPhoto = req.files.nicPhoto[0];
+    const paymentReceipt = await processFileUpload(req.files.paymentReceipt[0], 'booking-documents');
+    const nicDocument = await processFileUpload(req.files.nicPhoto[0], 'booking-documents');
 
     // Update booking with uploaded file URLs (from existing upload processing)
     await query(
@@ -1510,7 +1517,7 @@ router.post('/:id/upload-documents', auth, (req, res, next) => {
            status = 'payment_submitted',
            payment_submitted_at = NOW()
        WHERE id = ?`,
-      [paymentReceipt.url, nicPhoto.url, bookingId]
+      [paymentReceipt.url, nicDocument.url, bookingId]
     );
 
     // Notify property owner
@@ -1524,8 +1531,8 @@ router.post('/:id/upload-documents', auth, (req, res, next) => {
         bookingId,
         userId,
         JSON.stringify({
-          payment_receipt: paymentReceipt.filename,
-          nic_document: nicPhoto.filename
+          paymentReceipt: paymentReceipt.filename,  // UPDATED: Change key to paymentReceipt
+          nicPhoto: nicDocument.filename  // UPDATED: Change key to nicPhoto
         })
       ]
     );
@@ -1534,15 +1541,15 @@ router.post('/:id/upload-documents', auth, (req, res, next) => {
       success: true,
       message: 'Documents uploaded successfully',
       files: {
-        payment_receipt: {
+        paymentReceipt: {  // UPDATED: Change key to paymentReceipt
           url: paymentReceipt.url,
           filename: paymentReceipt.filename,
           originalname: paymentReceipt.originalname
         },
-        nic_photo: {
-          url: nicPhoto.url, 
-          filename: nicPhoto.filename,
-          originalname: nicPhoto.originalname
+        nicPhoto: {  // UPDATED: Change key to nicPhoto
+          url: nicDocument.url, 
+          filename: nicDocument.filename,
+          originalname: nicDocument.originalname
         }
       },
       booking_status: 'payment_submitted'
