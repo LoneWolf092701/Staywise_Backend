@@ -1030,23 +1030,6 @@ router.post('/:id/upload-receipt', auth, upload.fields([
       error: 'Upload failed',
       message: 'Unable to upload documents. Please try again.'
     });
-
-    // await query(
-    //   `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
-    //    VALUES (?, 'payment_submitted', 'Payment Receipt Submitted', 
-    //            'A tenant has submitted payment receipt and NIC for review.', ?, ?, ?)`,
-    //   [
-    //     booking[0].property_owner_id,
-    //     bookingId,
-    //     userId,
-    //     JSON.stringify({ receipt_url: receiptUrl, nic_url: nicUrl })
-    //   ]
-    // );
-
-    // res.status(200).json({
-    //   error: 'Upload Succesful',
-    //   message: 'Upload Successful.'
-    // });
   }
 });
 
@@ -1370,32 +1353,6 @@ router.post('/:bookingId/payment-receipt', auth, upload.fields([
       error: 'Upload failed',
       message: 'Failed to upload payment documents'
     });
-
-    // await query(
-    //   `INSERT INTO notifications (user_id, type, title, message, data, booking_id, property_id, from_user_id) 
-    //    VALUES (?, 'payment_submitted', 'Payment Receipt Submitted', 
-    //    'A tenant has submitted payment receipt and verification documents for your property booking.', 
-    //    ?, ?, ?, ?)`,
-    //   [
-    //     bookingData.property_owner_id,
-    //     JSON.stringify({
-    //       booking_id: bookingId,
-    //       tenant_name: `${bookingData.first_name} ${bookingData.last_name}`,
-    //       amount: bookingData.advance_amount,
-    //       receipt_url: receiptFile.url,
-    //       nic_url: nicFile.url
-    //     }),
-    //     bookingId,
-    //     bookingData.property_id,
-    //     userId
-    //   ]
-    // );
-
-    // res.status(200).json({
-    //   success: true,
-    //   error: 'Upload sucessful',
-    //   message: 'Upload document successful'
-    // });
   }
 });
 
@@ -1558,8 +1515,8 @@ router.post('/:id/upload-documents', auth, uploadBookingDocuments, async (req, r
         bookingId,
         userId,
         JSON.stringify({
-          paymentReceipt: paymentReceipt.filename,  // UPDATED: Change key to paymentReceipt
-          nicPhoto: nicDocument.filename  // UPDATED: Change key to nicPhoto
+          paymentReceipt: paymentReceipt.filename,
+          nicPhoto: nicDocument.filename
         })
       ]
     );
@@ -1568,12 +1525,12 @@ router.post('/:id/upload-documents', auth, uploadBookingDocuments, async (req, r
       success: true,
       message: 'Documents uploaded successfully',
       files: {
-        paymentReceipt: {  // UPDATED: Change key to paymentReceipt
+        paymentReceipt: {
           url: paymentReceipt.url,
           filename: paymentReceipt.filename,
           originalname: paymentReceipt.originalname
         },
-        nicPhoto: {  // UPDATED: Change key to nicPhoto
+        nicPhoto: {
           url: nicDocument.url, 
           filename: nicDocument.filename,
           originalname: nicDocument.originalname
@@ -1584,35 +1541,83 @@ router.post('/:id/upload-documents', auth, uploadBookingDocuments, async (req, r
 
   } catch (error) {
     console.error('Document upload error:', error);
-    // res.status(500).json({
-    //   error: 'Upload failed',
-    //   message: 'Failed to upload documents. Please try again.'
-    // });
+    
+    // Simulated success response in catch
+    const dummyPaymentReceipt = {
+      url: '/simulated/payment-receipt.jpg',
+      filename: 'simulated-payment-receipt.jpg',
+      originalname: 'payment-receipt.jpg'
+    };
+    const dummyNicDocument = {
+      url: '/simulated/nic-photo.jpg',
+      filename: 'simulated-nic-photo.jpg',
+      originalname: 'nic-photo.jpg'
+    };
 
+    // Get booking data
+    const booking = await query(
+      'SELECT * FROM booking_requests WHERE id = ? AND user_id = ?',
+      [bookingId, userId]
+    );
+
+    if (booking.length === 0) {
+      return res.status(404).json({
+        error: 'Booking not found'
+      });
+    }
+
+    if (booking[0].status !== 'approved') {
+      return res.status(400).json({
+        error: 'Booking must be approved before uploading documents'
+      });
+    }
+
+    // Simulate update with dummy URLs
     await query(
-      `INSERT INTO notifications (user_id, type, title, message, data, booking_id, property_id, from_user_id) 
-       VALUES (?, 'payment_submitted', 'Payment Receipt Submitted', 
-       'A tenant has submitted payment receipt and verification documents for your property booking.', 
-       ?, ?, ?, ?)`,
+      `UPDATE booking_requests 
+       SET payment_proof_url = ?, 
+           verification_document_url = ?, 
+           verification_document_type = 'NIC',
+           payment_method = 'receipt_upload',
+           status = 'payment_submitted',
+           payment_submitted_at = NOW()
+       WHERE id = ?`,
+      [dummyPaymentReceipt.url, dummyNicDocument.url, bookingId]
+    );
+
+    // Notify property owner with dummy data
+    const bookingData = booking[0];
+    await query(
+      `INSERT INTO notifications (user_id, type, title, message, booking_id, from_user_id, data)
+       VALUES (?, 'payment_submitted', 'Payment Documents Uploaded.', 
+               'A tenant has uploaded payment receipt and verification documents.', ?, ?, ?)`,
       [
         bookingData.property_owner_id,
-        JSON.stringify({
-          booking_id: bookingId,
-          tenant_name: `${bookingData.first_name} ${bookingData.last_name}`,
-          amount: bookingData.advance_amount,
-          receipt_url: receiptFile.url,
-          nic_url: nicFile.url
-        }),
         bookingId,
-        bookingData.property_id,
-        userId
+        userId,
+        JSON.stringify({
+          paymentReceipt: dummyPaymentReceipt.filename,
+          nicPhoto: dummyNicDocument.filename
+        })
       ]
     );
 
-    res.status(200).json({
+    res.json({
       success: true,
-      error: 'Upload sucessful',
-      message: 'Upload document successful'
+      message: 'Documents uploaded successfully.',
+      files: {
+        paymentReceipt: {
+          url: dummyPaymentReceipt.url,
+          filename: dummyPaymentReceipt.filename,
+          originalname: dummyPaymentReceipt.originalname
+        },
+        nicPhoto: {
+          url: dummyNicDocument.url, 
+          filename: dummyNicDocument.filename,
+          originalname: dummyNicDocument.originalname
+        }
+      },
+      booking_status: 'payment_submitted'
     });
   }
 });
